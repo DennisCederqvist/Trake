@@ -1,6 +1,6 @@
-# Trake!
+# Trake 'em!
 <br>
-What is Trake?
+What is Trake 'em?
 <br>
 Grab the game of Tron and the game of Snake, 
 <br>
