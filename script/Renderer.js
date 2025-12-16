@@ -1,6 +1,7 @@
-// Renderer.js – ansvarar för att rita spelplan, mat och alla ormar (Tron-style, sharp 90° turns)
+// Renderer.js – Tron-style + grid + mat + powerups
 
 import { COLORS } from "./Config.js";
+import { PowerUpType } from "./PowerUps.js";
 
 export class Renderer {
   constructor(canvas, cols, rows, cellSize) {
@@ -11,7 +12,6 @@ export class Renderer {
     this.rows = rows;
     this.cellSize = cellSize;
 
-    // Sätt canvas storlek efter grid
     this.canvas.width = this.cols * this.cellSize;
     this.canvas.height = this.rows * this.cellSize;
   }
@@ -23,16 +23,23 @@ export class Renderer {
     ctx.fillStyle = COLORS.background;
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
-    // === GRID (subtil Tron-guide) ===
+    // Grid
     this.drawGrid();
 
-    // Ram runt spelplanen
+    // Ram
     ctx.strokeStyle = COLORS.borderStroke;
     ctx.lineWidth = 2;
     ctx.strokeRect(0, 0, this.cols * this.cellSize, this.rows * this.cellSize);
 
+    // === POWERUPS ===
+    if (state.powerUps?.length) {
+      for (const p of state.powerUps) {
+        this.drawPowerUp(p);
+      }
+    }
+
     // === MAT (neon-orb) ===
-    if (state.foods && state.foods.length > 0) {
+    if (state.foods?.length) {
       for (const food of state.foods) {
         const fx = (food.x + 0.5) * this.cellSize;
         const fy = (food.y + 0.5) * this.cellSize;
@@ -42,7 +49,6 @@ export class Renderer {
 
         ctx.save();
 
-        // yttre glow
         ctx.beginPath();
         ctx.arc(fx, fy, rOuter, 0, Math.PI * 2);
         ctx.fillStyle = "rgba(0, 255, 255, 0.18)";
@@ -50,7 +56,6 @@ export class Renderer {
         ctx.shadowBlur = Math.max(6, this.cellSize * 0.6);
         ctx.fill();
 
-        // inre kärna
         ctx.shadowBlur = 0;
         ctx.beginPath();
         ctx.arc(fx, fy, rInner, 0, Math.PI * 2);
@@ -61,8 +66,8 @@ export class Renderer {
       }
     }
 
-    // === ORMAR (Tron trail + head) ===
-    if (state.snakes && state.snakes.length > 0) {
+    // === ORMAR ===
+    if (state.snakes?.length) {
       for (const snake of state.snakes) {
         const segments = snake.segments;
         if (!segments || segments.length < 2) continue;
@@ -72,31 +77,26 @@ export class Renderer {
           y: (p.y + 0.5) * this.cellSize,
         });
 
-        // --- TRAIL (Tron: alltid 90° hörn, inga diagonaler) ---
         const points = segments.map(toPx);
         const ortho = this._makeOrthoPath(points);
 
+        // Trail
         ctx.save();
 
         ctx.beginPath();
         ctx.moveTo(ortho[0].x, ortho[0].y);
-        for (let i = 1; i < ortho.length; i++) {
-          ctx.lineTo(ortho[i].x, ortho[i].y);
-        }
+        for (let i = 1; i < ortho.length; i++) ctx.lineTo(ortho[i].x, ortho[i].y);
 
-        // Skarpa hörn (retro Tron)
-        ctx.lineCap = "butt";     // testa "square" om du vill
-        ctx.lineJoin = "miter";   // skarpa 90° hörn
+        ctx.lineCap = "butt";
+        ctx.lineJoin = "miter";
         ctx.miterLimit = 2;
 
-        // Yttre glow-lager
         ctx.strokeStyle = "rgba(0, 255, 255, 0.22)";
         ctx.lineWidth = Math.max(2, this.cellSize * 0.34);
         ctx.shadowColor = "rgba(0, 255, 255, 0.85)";
         ctx.shadowBlur = Math.max(6, this.cellSize * 0.7);
         ctx.stroke();
 
-        // Inre kärna (bright line)
         ctx.shadowBlur = 0;
         ctx.strokeStyle = "rgba(200, 255, 255, 0.95)";
         ctx.lineWidth = Math.max(2, this.cellSize * 0.16);
@@ -104,17 +104,14 @@ export class Renderer {
 
         ctx.restore();
 
-        // --- HEAD (liten lightcycle) ---
+        // Head
         const headPx = toPx(segments[0]);
 
-        // Räkna ut riktning utifrån första två segmenten
         let angle = 0;
         if (segments.length >= 2) {
           const h = segments[0];
           const n = segments[1];
-          const dx = h.x - n.x;
-          const dy = h.y - n.y;
-          angle = Math.atan2(dy, dx);
+          angle = Math.atan2(h.y - n.y, h.x - n.x);
         }
 
         const headW = this.cellSize * 0.60;
@@ -125,11 +122,9 @@ export class Renderer {
         ctx.translate(headPx.x, headPx.y);
         ctx.rotate(angle);
 
-        // Glow runt head
         ctx.shadowColor = "rgba(0, 255, 255, 0.9)";
         ctx.shadowBlur = Math.max(6, this.cellSize * 0.6);
 
-        // Body
         ctx.fillStyle = "rgba(0, 255, 255, 0.28)";
         ctx.strokeStyle = "rgba(200, 255, 255, 0.95)";
         ctx.lineWidth = 2;
@@ -137,11 +132,9 @@ export class Renderer {
         roundRect(ctx, -headW / 2, -headH / 2, headW, headH, radius);
         ctx.fill();
 
-        // Stroke utan extra blur (krispigt)
         ctx.shadowBlur = 0;
         ctx.stroke();
 
-        // Liten highlight/visor
         ctx.fillStyle = "rgba(255, 255, 255, 0.18)";
         roundRect(
           ctx,
@@ -158,48 +151,87 @@ export class Renderer {
     }
   }
 
-  // === GRID ===
+  drawPowerUp(p) {
+    const ctx = this.ctx;
+
+    const px = (p.x + 0.5) * this.cellSize;
+    const py = (p.y + 0.5) * this.cellSize;
+
+    // olika färger per typ
+    let glow = "rgba(255,255,0,0.85)";
+    let fill = "rgba(255,255,0,0.20)";
+    let core = "rgba(255,255,220,0.95)";
+
+    if (p.type === PowerUpType.SPEED) {
+      glow = "rgba(255, 255, 0, 0.85)";
+      fill = "rgba(255, 255, 0, 0.18)";
+      core = "rgba(255, 255, 220, 0.95)";
+    } else if (p.type === PowerUpType.SLOW) {
+      glow = "rgba(0, 140, 255, 0.85)";
+      fill = "rgba(0, 140, 255, 0.18)";
+      core = "rgba(210, 240, 255, 0.95)";
+    } else if (p.type === PowerUpType.GHOST) {
+      glow = "rgba(180, 90, 255, 0.85)";
+      fill = "rgba(180, 90, 255, 0.18)";
+      core = "rgba(240, 220, 255, 0.95)";
+    } else if (p.type === PowerUpType.SHRINK) {
+      glow = "rgba(255, 90, 90, 0.85)";
+      fill = "rgba(255, 90, 90, 0.18)";
+      core = "rgba(255, 220, 220, 0.95)";
+    }
+
+    const r = Math.max(5, this.cellSize * 0.22);
+
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(Math.PI / 4);
+
+    ctx.fillStyle = fill;
+    ctx.shadowColor = glow;
+    ctx.shadowBlur = Math.max(6, this.cellSize * 0.6);
+    ctx.fillRect(-r, -r, r * 2, r * 2);
+
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = core;
+    ctx.fillRect(-r * 0.45, -r * 0.45, r * 0.9, r * 0.9);
+
+    ctx.restore();
+  }
+
   drawGrid() {
-  const ctx = this.ctx;
+    const ctx = this.ctx;
 
-  ctx.save();
+    ctx.save();
 
-  const w = this.canvas.width;
-  const h = this.canvas.height;
+    const w = this.canvas.width;
+    const h = this.canvas.height;
 
-  ctx.strokeStyle = COLORS.gridLine ?? "rgba(255, 255, 255, 0.08)";
-  ctx.lineWidth = 1;
-  ctx.shadowColor = COLORS.gridGlow ?? "rgba(0, 255, 255, 0.12)";
-  ctx.shadowBlur = Math.max(2, this.cellSize * 0.12);
+    ctx.strokeStyle = COLORS.gridLine ?? "rgba(255, 255, 255, 0.08)";
+    ctx.lineWidth = 1;
+    ctx.shadowColor = COLORS.gridGlow ?? "rgba(0, 255, 255, 0.12)";
+    ctx.shadowBlur = Math.max(2, this.cellSize * 0.12);
 
-  // Vertikala linjer genom cell-centers
-  for (let c = 0; c < this.cols; c++) {
-    const x = (c + 0.5) * this.cellSize;
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, h);
-    ctx.stroke();
+    for (let c = 0; c < this.cols; c++) {
+      const x = (c + 0.5) * this.cellSize;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+
+    for (let r = 0; r < this.rows; r++) {
+      const y = (r + 0.5) * this.cellSize;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+    }
+
+    ctx.restore();
   }
 
-  // Horisontella linjer genom cell-centers
-  for (let r = 0; r < this.rows; r++) {
-    const y = (r + 0.5) * this.cellSize;
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(w, y);
-    ctx.stroke();
-  }
-
-  ctx.restore();
-}
-
-  /**
-   * Bygger en ortogonal (endast horisontell/vertikal) punktlista från input.
-   * Om två punkter är diagonala (både x och y skiljer), så lägger vi in ett L-hörn.
-   */
   _makeOrthoPath(points) {
     if (!points || points.length < 2) return points ?? [];
-
     const ortho = [points[0]];
 
     for (let i = 1; i < points.length; i++) {
@@ -209,7 +241,6 @@ export class Renderer {
       const dx = cur.x - prev.x;
       const dy = cur.y - prev.y;
 
-      // diagonal => lägg in ett L-hörn
       if (dx !== 0 && dy !== 0) {
         const before = ortho.length >= 2 ? ortho[ortho.length - 2] : null;
 
@@ -217,18 +248,10 @@ export class Renderer {
           const lastDx = prev.x - before.x;
           const lastDy = prev.y - before.y;
 
-          // kom vi in horisontellt? gå horisontellt först
-          if (lastDx !== 0) {
-            ortho.push({ x: cur.x, y: prev.y });
-          } else if (lastDy !== 0) {
-            // kom vi in vertikalt? gå vertikalt först
-            ortho.push({ x: prev.x, y: cur.y });
-          } else {
-            // fallback
-            ortho.push({ x: cur.x, y: prev.y });
-          }
+          if (lastDx !== 0) ortho.push({ x: cur.x, y: prev.y });
+          else if (lastDy !== 0) ortho.push({ x: prev.x, y: cur.y });
+          else ortho.push({ x: cur.x, y: prev.y });
         } else {
-          // fallback: horisontellt först
           ortho.push({ x: cur.x, y: prev.y });
         }
       }
@@ -240,7 +263,6 @@ export class Renderer {
   }
 }
 
-// Helper: rundad rektangel (egen implementation för kompatibilitet)
 function roundRect(ctx, x, y, w, h, r) {
   const rr = Math.min(r, w / 2, h / 2);
   ctx.beginPath();

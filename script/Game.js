@@ -1,290 +1,321 @@
-// Game.js – håller all logik för spelet (singleplayer än så länge)
+// Game.js – singleplayer + powerups (multiplayer-säkert state)
 
 import { Snake } from "./Snake.js";
-import { GRID_COLS, GRID_ROWS, CELL_SIZE, FOOD_COUNT } from "./Config.js";
+import {
+  GRID_COLS,
+  GRID_ROWS,
+  CELL_SIZE,
+  FOOD_COUNT,
+  POWERUP_COUNT,
+  POWERUP_RESPAWN_MIN_MS,
+  POWERUP_RESPAWN_MAX_MS,
+  EFFECT,
+} from "./Config.js";
 import { Renderer } from "./Renderer.js";
+import { PowerUpManager, PowerUpType } from "./PowerUps.js";
 
 export class Game {
-	constructor(canvas, scoreElement) {
-		this.canvas = canvas;
-		this.scoreElement = scoreElement;
+  constructor(canvas, scoreElement) {
+    this.canvas = canvas;
+    this.scoreElement = scoreElement;
 
-		this.cols = GRID_COLS;
-		this.rows = GRID_ROWS;
-		this.cellSize = CELL_SIZE;
+    this.cols = GRID_COLS;
+    this.rows = GRID_ROWS;
+    this.cellSize = CELL_SIZE;
 
-		this.renderer = new Renderer(this.canvas, this.cols, this.rows, this.cellSize);
+    this.renderer = new Renderer(this.canvas, this.cols, this.rows, this.cellSize);
 
-		this.snake = null;
-		this.foods = [];
-		this.score = 0;
+    this.snake = null;
+    this.foods = [];
+    this.score = 0;
 
-		// Hastighet + paus
-		this.baseMoveDuration = 120;               // ms per steg
-		this.moveDuration = this.baseMoveDuration;
-		this.isBoosting = false;
-		this.isRunning = false;                    // ⬅ spelet startar pausat
+    // Hastighet + paus
+    this.baseMoveDuration = 120; // ms per steg (baseline)
+    this.moveDuration = this.baseMoveDuration;
+    this.isRunning = false;
 
-		this.lastSegments = null;
-		this.moveProgress = 0;
-		this.lastTime = null;
+    this.lastSegments = null;
+    this.moveProgress = 0;
+    this.lastTime = null;
+    this.now = 0;
 
-		this.foodSpawnToken = 0;
+    this.foodSpawnToken = 0;
+    this.powerSpawnToken = 0;
 
-		this.onPlayerDeath = null;                 // callback som UI sätter
+    this.onPlayerDeath = null;
 
-		this.reset();      // förbered world state
-		this.startLoop();  // starta render-loop (men inte själva spelet)
-	}
+    this.powerUps = new PowerUpManager({
+      cols: this.cols,
+      rows: this.rows,
+      maxCount: POWERUP_COUNT,
+      respawnMinMs: POWERUP_RESPAWN_MIN_MS,
+      respawnMaxMs: POWERUP_RESPAWN_MAX_MS,
+    });
 
-	// Kallas från UI när man trycker "Play" eller "Play Again"
-	startGame() {
-		this.reset();
-		this.isRunning = true;
-	}
+    this.reset();
+    this.startLoop();
+  }
 
-	// UI kan registrera en callback som triggas när spelaren dör
-	setOnPlayerDeath(callback) {
-		this.onPlayerDeath = callback;
-	}
+  startGame() {
+    this.reset();
+    this.isRunning = true;
+  }
 
-	reset() {
-		// ogiltigförklara gamla food-timers
-		this.foodSpawnToken++;
+  setOnPlayerDeath(callback) {
+    this.onPlayerDeath = callback;
+  }
 
-		const dirs = [
-			{ x: 1, y: 0 },   // höger
-			{ x: -1, y: 0 },  // vänster
-			{ x: 0, y: -1 },  // upp
-			{ x: 0, y: 1 }    // ner
-		];
+  reset() {
+    this.foodSpawnToken++;
+    this.powerSpawnToken++;
 
-		const startDir = dirs[Math.floor(Math.random() * dirs.length)];
+    const dirs = [
+      { x: 1, y: 0 },
+      { x: -1, y: 0 },
+      { x: 0, y: -1 },
+      { x: 0, y: 1 },
+    ];
+    const startDir = dirs[Math.floor(Math.random() * dirs.length)];
 
-		// Start i mitten
-		const startX = Math.floor(this.cols / 2);
-		const startY = Math.floor(this.rows / 2);
+    const startX = Math.floor(this.cols / 2);
+    const startY = Math.floor(this.rows / 2);
 
-		this.snake = new Snake(startX, startY, {
-			startDirection: startDir,
-			colorHead: "#d783ff",
-			colorHeadStroke: "#b300ff",
-			colorBody: "#4dff4d",
-			tailScale: 0.6
-		});
+    this.snake = new Snake(startX, startY, {
+      startDirection: startDir,
+      colorHead: "#d783ff",
+      colorHeadStroke: "#b300ff",
+      colorBody: "#4dff4d",
+      tailScale: 0.6,
+    });
 
-		this.score = 0;
-		this.updateScore();
+    this.score = 0;
+    this.updateScore();
 
-		this.foods = [];
-		this.spawnInitialFood();
+    this.foods = [];
+    this.spawnInitialFood();
 
-		this.lastSegments = this.snake.segments.map(seg => ({ ...seg }));
-		this.moveProgress = 0;
+    // powerups: reset + spawn initial set
+    this.powerUps.reset();
+    this.powerUps.initSpawn((x, y) => this.isCellBlocked(x, y));
 
-		this.isBoosting = false;
-		this.moveDuration = this.baseMoveDuration;
-	}
+    this.lastSegments = this.snake.segments.map((seg) => ({ ...seg }));
+    this.moveProgress = 0;
 
-	startLoop() {
-		this.lastTime = performance.now();
-		requestAnimationFrame(this.loop.bind(this));
-	}
+    this.moveDuration = this.baseMoveDuration;
+  }
 
-	updateScore() {
-		if (this.scoreElement) {
-			this.scoreElement.textContent = String(this.score);
-		}
-	}
+  startLoop() {
+    this.lastTime = performance.now();
+    requestAnimationFrame(this.loop.bind(this));
+  }
 
-	// Spawn:a startmaten direkt
-	spawnInitialFood() {
-		for (let i = 0; i < FOOD_COUNT; i++) {
-			this.spawnFood();
-		}
-	}
+  updateScore() {
+    if (this.scoreElement) this.scoreElement.textContent = String(this.score);
+  }
 
-	// Spawn:a EN matbit på en tom ruta (om vi inte redan har max)
-	spawnFood() {
-		if (this.foods.length >= FOOD_COUNT) return;
+  spawnInitialFood() {
+    for (let i = 0; i < FOOD_COUNT; i++) this.spawnFood();
+  }
 
-		let safety = 0;
+  spawnFood() {
+    if (this.foods.length >= FOOD_COUNT) return;
 
-		while (safety < 1000) {
-			safety++;
-			const x = Math.floor(Math.random() * this.cols);
-			const y = Math.floor(Math.random() * this.rows);
+    for (let safety = 0; safety < 1000; safety++) {
+      const x = Math.floor(Math.random() * this.cols);
+      const y = Math.floor(Math.random() * this.rows);
 
-			const onSnake = this.snake.segments.some(seg => seg.x === x && seg.y === y);
-			const onFood = this.foods.some(food => food.x === x && food.y === y);
+      const onSnake = this.snake.segments.some((seg) => seg.x === x && seg.y === y);
+      const onFood = this.foods.some((f) => f.x === x && f.y === y);
+      const onPower = this.powerUps.powerUps.some((p) => p.x === x && p.y === y);
 
-			if (!onSnake && !onFood) {
-				this.foods.push({ x, y });
-				return;
-			}
-		}
-	}
+      if (!onSnake && !onFood && !onPower) {
+        this.foods.push({ x, y });
+        return;
+      }
+    }
+  }
 
-	// Schemalägg respawn med delay 0.5–3 sek
-	scheduleFoodRespawn() {
-		const tokenAtSchedule = this.foodSpawnToken;
-		const delay = 500 + Math.random() * 2500;
+  scheduleFoodRespawn() {
+    const tokenAtSchedule = this.foodSpawnToken;
+    const delay = 500 + Math.random() * 2500;
 
-		setTimeout(() => {
-			if (tokenAtSchedule !== this.foodSpawnToken) return;
-			if (this.foods.length >= FOOD_COUNT) return;
+    setTimeout(() => {
+      if (tokenAtSchedule !== this.foodSpawnToken) return;
+      if (this.foods.length >= FOOD_COUNT) return;
+      this.spawnFood();
+    }, delay);
+  }
 
-			this.spawnFood();
-		}, delay);
-	}
+  schedulePowerRespawn() {
+    const tokenAtSchedule = this.powerSpawnToken;
+    const delay = POWERUP_RESPAWN_MIN_MS + Math.random() * (POWERUP_RESPAWN_MAX_MS - POWERUP_RESPAWN_MIN_MS);
 
-	loop(timestamp) {
-		if (this.lastTime == null) {
-			this.lastTime = timestamp;
-		}
+    setTimeout(() => {
+      if (tokenAtSchedule !== this.powerSpawnToken) return;
+      // se till att vi fyller på tillbaka till max
+      this.powerUps.ensureSpawn((x, y) => this.isCellBlocked(x, y));
+    }, delay);
+  }
 
-		const delta = timestamp - this.lastTime;
-		this.lastTime = timestamp;
+  isCellBlocked(x, y) {
+    const onSnake = this.snake.segments.some((s) => s.x === x && s.y === y);
+    const onFood = this.foods.some((f) => f.x === x && f.y === y);
+    const onPower = this.powerUps.powerUps.some((p) => p.x === x && p.y === y);
+    return onSnake || onFood || onPower;
+  }
 
-		// Om spelet är pausat: bara rita current state
-		if (!this.isRunning) {
-			this.render(this.moveProgress);
-			requestAnimationFrame(this.loop.bind(this));
-			return;
-		}
+  getSpeedMultiplier(now) {
+    let mult = 1.0;
 
-		this.moveProgress += delta / this.moveDuration;
+    if (this.powerUps.isActive(PowerUpType.SPEED)) mult *= EFFECT.SPEED_MULT;
+    if (this.powerUps.isActive(PowerUpType.SLOW)) mult *= EFFECT.SLOW_MULT;
 
-		while (this.moveProgress >= 1) {
-			this.moveProgress -= 1;
-			this.tick();
-		}
+    // clamp lite så vi inte får helt vansinnig speed
+    return Math.max(0.35, Math.min(3.0, mult));
+  }
 
-		this.render(this.moveProgress);
+  loop(timestamp) {
+    if (this.lastTime == null) this.lastTime = timestamp;
 
-		requestAnimationFrame(this.loop.bind(this));
-	}
+    const delta = timestamp - this.lastTime;
+    this.lastTime = timestamp;
+    this.now = timestamp;
 
-	tick() {
-		this.lastSegments = this.snake.segments.map(seg => ({ ...seg }));
+    // paus: rita bara, inga timers tickar
+    if (!this.isRunning) {
+      this.render(this.moveProgress);
+      requestAnimationFrame(this.loop.bind(this));
+      return;
+    }
 
-		this.snake.step();
-		const head = this.snake.segments[0];
+    // timers/effects
+    this.powerUps.update(timestamp);
 
-		// Väggkollision
-		if (
-			head.x < 0 ||
-			head.x >= this.cols ||
-			head.y < 0 ||
-			head.y >= this.rows
-		) {
-			this.handleDeath();
-			return;
-		}
+    // hastighet från effekter
+    const mult = this.getSpeedMultiplier(timestamp);
+    this.moveDuration = this.baseMoveDuration / mult;
 
-		// Egen kropp
-		for (let i = 1; i < this.snake.segments.length; i++) {
-			const seg = this.snake.segments[i];
-			if (seg.x === head.x && seg.y === head.y) {
-				this.handleDeath();
-				return;
-			}
-		}
+    this.moveProgress += delta / this.moveDuration;
 
-		// Matkollision
-		const eatenIndex = this.foods.findIndex(
-			(food) => food.x === head.x && food.y === head.y
-		);
+    while (this.moveProgress >= 1) {
+      this.moveProgress -= 1;
+      this.tick();
+    }
 
-		if (eatenIndex !== -1) {
-			this.snake.grow();
-			this.score += 10;
-			this.updateScore();
+    this.render(this.moveProgress);
+    requestAnimationFrame(this.loop.bind(this));
+  }
 
-			this.foods.splice(eatenIndex, 1);
-			this.scheduleFoodRespawn();
-		}
-	}
+  tick() {
+    this.lastSegments = this.snake.segments.map((seg) => ({ ...seg }));
 
-	handleDeath() {
-		// Pausa spelet
-		this.isRunning = false;
+    this.snake.step();
+    const head = this.snake.segments[0];
 
-		// Låt UI ta hand om overlay osv
-		if (this.onPlayerDeath) {
-			this.onPlayerDeath({ score: this.score });
-		}
-	}
+    // Väggkollision (ghost går INTE genom väggar)
+    if (head.x < 0 || head.x >= this.cols || head.y < 0 || head.y >= this.rows) {
+      this.handleDeath();
+      return;
+    }
 
-	render(progress = 1) {
-		const segmentsToDraw = this.snake.segments.map((seg, index) => {
-			if (!this.lastSegments || !this.lastSegments[index]) {
-				return { x: seg.x, y: seg.y };
-			}
+    // Egen kropp (ghost ignorerar self-collision)
+    const isGhost = this.powerUps.isActive(PowerUpType.GHOST);
+    if (!isGhost) {
+      for (let i = 1; i < this.snake.segments.length; i++) {
+        const seg = this.snake.segments[i];
+        if (seg.x === head.x && seg.y === head.y) {
+          this.handleDeath();
+          return;
+        }
+      }
+    }
 
-			const prev = this.lastSegments[index];
+    // Powerup pickup
+    const picked = this.powerUps.collectAt(head.x, head.y);
+    if (picked) {
+      switch (picked.type) {
+        case PowerUpType.SPEED:
+          this.powerUps.activate(PowerUpType.SPEED, this.now, EFFECT.SPEED_MS);
+          break;
 
-			return {
-				x: prev.x + (seg.x - prev.x) * progress,
-				y: prev.y + (seg.y - prev.y) * progress
-			};
-		});
+        case PowerUpType.SLOW:
+          // Singleplayer: du blir slowad (multiplayer: applicera på motståndare)
+          this.powerUps.activate(PowerUpType.SLOW, this.now, EFFECT.SLOW_MS);
+          break;
 
-		const state = {
-			foods: this.foods,
-			snakes: [
-				{
-					segments: segmentsToDraw,
-					colorHead: this.snake.colorHead,
-					colorHeadStroke: this.snake.colorHeadStroke,
-					colorBody: this.snake.colorBody,
-					tailScale: this.snake.tailScale
-				}
-			]
-		};
+        case PowerUpType.GHOST:
+          this.powerUps.activate(PowerUpType.GHOST, this.now, EFFECT.GHOST_MS);
+          break;
 
-		this.renderer.render(state);
-	}
+        case PowerUpType.SHRINK:
+          this.snake.shrink(EFFECT.SHRINK_AMOUNT, EFFECT.MIN_SNAKE_LEN);
+          break;
+      }
 
-	// ==== INPUT-HANTERING ====
+      // respawn av powerup efter kort delay
+      this.schedulePowerRespawn();
+    }
 
-	handleKeyDown(key) {
-		switch (key) {
-			case "ArrowUp":
-				this.snake.setDirection(0, -1);
-				break;
-			case "ArrowDown":
-				this.snake.setDirection(0, 1);
-				break;
-			case "ArrowLeft":
-				this.snake.setDirection(-1, 0);
-				break;
-			case "ArrowRight":
-				this.snake.setDirection(1, 0);
-				break;
-			case "Space":
-				this.enableBoost();
-				break;
-		}
-	}
+    // Matkollision
+    const eatenIndex = this.foods.findIndex((f) => f.x === head.x && f.y === head.y);
+    if (eatenIndex !== -1) {
+      this.snake.grow();
+      this.score += 10;
+      this.updateScore();
 
-	handleKeyUp(key) {
-		switch (key) {
-			case "Space":
-				this.disableBoost();
-				break;
-		}
-	}
+      this.foods.splice(eatenIndex, 1);
+      this.scheduleFoodRespawn();
+    }
+  }
 
-	enableBoost() {
-		if (this.isBoosting) return;
-		this.isBoosting = true;
-		this.moveDuration = this.baseMoveDuration / 2;
-	}
+  handleDeath() {
+    this.isRunning = false;
+    if (this.onPlayerDeath) this.onPlayerDeath({ score: this.score });
+  }
 
-	disableBoost() {
-		if (!this.isBoosting) return;
-		this.isBoosting = false;
-		this.moveDuration = this.baseMoveDuration;
-	}
+  render(progress = 1) {
+    const segmentsToDraw = this.snake.segments.map((seg, index) => {
+      if (!this.lastSegments || !this.lastSegments[index]) return { x: seg.x, y: seg.y };
+      const prev = this.lastSegments[index];
+      return {
+        x: prev.x + (seg.x - prev.x) * progress,
+        y: prev.y + (seg.y - prev.y) * progress,
+      };
+    });
+
+    const state = {
+      foods: this.foods,
+      powerUps: this.powerUps.powerUps,
+      activeEffects: this.powerUps.activeEffects,
+      snakes: [
+        {
+          segments: segmentsToDraw,
+          colorHead: this.snake.colorHead,
+          colorHeadStroke: this.snake.colorHeadStroke,
+          colorBody: this.snake.colorBody,
+          tailScale: this.snake.tailScale,
+        },
+      ],
+    };
+
+    this.renderer.render(state);
+  }
+
+  // ==== INPUT ====
+  handleKeyDown(key) {
+    switch (key) {
+      case "ArrowUp":
+        this.snake.setDirection(0, -1);
+        break;
+      case "ArrowDown":
+        this.snake.setDirection(0, 1);
+        break;
+      case "ArrowLeft":
+        this.snake.setDirection(-1, 0);
+        break;
+      case "ArrowRight":
+        this.snake.setDirection(1, 0);
+        break;
+    }
+  }
 }
