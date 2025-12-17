@@ -2,7 +2,7 @@ import { mpapi } from "./mpapi.js";
 import { MultiplayerGame } from "./MultiplayerGame.js";
 
 export class MultiplayerController {
-  constructor({ canvas, scoreElement, ui, serverUrl, identifier }) {
+  constructor({ canvas, scoreElement, ui, serverUrl, identifier, singleGame }) {
     this.canvas = canvas;
     this.scoreElement = scoreElement;
     this.ui = ui;
@@ -10,13 +10,15 @@ export class MultiplayerController {
     this.serverUrl = serverUrl;
     this.identifier = identifier;
 
+    this.singleGame = singleGame;
+
     this.api = null;
 
-    this.isHost = false;
     this.sessionId = null;
     this.clientId = null;
+    this.isHost = false;
 
-    this.players = new Map(); // clientId -> {name, ready, slot}
+    this.players = new Map(); // clientId -> { name, ready, slot }
     this.localReady = false;
     this.localName = "Player";
 
@@ -28,10 +30,12 @@ export class MultiplayerController {
       this.ui.onMpReadyToggle = () => this.toggleReady();
       this.ui.onMpLeave = () => this.leaveLobby();
     }
+
+    console.log("[MP] controller ready");
   }
 
-  isInMultiplayerGame() {
-    return !!this.game?.isRunning;
+  isInMultiplayerSession() {
+    return !!this.api && typeof this.sessionId === "string" && this.sessionId.length > 0;
   }
 
   ensureApi() {
@@ -45,21 +49,8 @@ export class MultiplayerController {
       else if (cmd === "closed") this.onClosed();
       else if (cmd === "game") this.onGameMessage(clientId, data);
     });
-  }
 
-  rebuildLobbyUi() {
-    if (!this.ui) return;
-
-    const list = Array.from(this.players.entries())
-      .map(([cid, p]) => ({
-        name: p.name,
-        ready: !!p.ready,
-        isHost: this.isHost ? cid === this.clientId : cid === this.hostId,
-      }))
-      .sort((a, b) => (a.isHost === b.isHost ? 0 : a.isHost ? -1 : 1));
-
-    this.ui.setLobbyPlayers(list);
-    this.ui.setReadyButtonState(this.localReady);
+    console.log("[MP] api created");
   }
 
   async hostLobby(name) {
@@ -69,11 +60,20 @@ export class MultiplayerController {
     this.localReady = false;
     this.localName = (name || "Player").trim() || "Player";
 
-    const res = await this.api.host({ name: this.localName, private: true }).catch((e) => {
-      console.error("Host failed:", e);
-      return null;
-    });
-    if (!res) return;
+    console.log("[MP] hosting as", this.localName);
+
+    let res;
+    try {
+      res = await this.api.host({ name: this.localName, private: true });
+    } catch (e) {
+      console.error("[MP] host failed", e);
+      return;
+    }
+
+    if (!res?.session || !res?.clientId) {
+      console.error("[MP] host response invalid", res);
+      return;
+    }
 
     this.sessionId = res.session;
     this.clientId = res.clientId;
@@ -84,23 +84,40 @@ export class MultiplayerController {
     this.ui?.showLobby();
     this.ui?.setLobbyCode(this.sessionId);
     this.ui?.setCountdown("");
+    this.ui?.setReadyButtonState(false);
 
     this.rebuildLobbyUi();
+
+    this.assignSlotsHostSide();
     this.broadcastLobbyState();
+
+    console.log("[MP] host ok, session:", this.sessionId);
   }
 
   async joinLobby(code, name) {
+    const session = (code || "").trim();
+    if (!session) return;
+
     this.ensureApi();
 
     this.isHost = false;
     this.localReady = false;
     this.localName = (name || "Player").trim() || "Player";
 
-    const res = await this.api.join(code, { name: this.localName }).catch((e) => {
-      console.error("Join failed:", e);
-      return null;
-    });
-    if (!res) return;
+    console.log("[MP] joining", session, "as", this.localName);
+
+    let res;
+    try {
+      res = await this.api.join(session, { name: this.localName });
+    } catch (e) {
+      console.error("[MP] join failed", e);
+      return;
+    }
+
+    if (!res?.session || !res?.clientId) {
+      console.error("[MP] join response invalid", res);
+      return;
+    }
 
     this.sessionId = res.session;
     this.clientId = res.clientId;
@@ -109,22 +126,22 @@ export class MultiplayerController {
     for (const cid of res.clients ?? []) {
       this.players.set(cid, { name: `Player-${String(cid).slice(-4)}`, ready: false, slot: 0 });
     }
-    if (!this.players.has(this.clientId)) {
-      this.players.set(this.clientId, { name: this.localName, ready: false, slot: 0 });
-    } else {
-      this.players.get(this.clientId).name = this.localName;
-    }
+    this.players.set(this.clientId, { name: this.localName, ready: false, slot: 0 });
 
     this.ui?.showLobby();
     this.ui?.setLobbyCode(this.sessionId);
     this.ui?.setCountdown("");
-
-    this.api.transmit({ type: "lobby_sync_request" });
+    this.ui?.setReadyButtonState(false);
     this.rebuildLobbyUi();
+
+    // Be host om state
+    this.api.transmit({ type: "lobby_sync_request" });
+
+    console.log("[MP] join ok, session:", this.sessionId);
   }
 
   toggleReady() {
-    if (!this.api || !this.sessionId) return;
+    if (!this.isInMultiplayerSession()) return;
 
     this.localReady = !this.localReady;
 
@@ -134,27 +151,31 @@ export class MultiplayerController {
       me.name = this.localName;
     }
 
+    this.ui?.setReadyButtonState(this.localReady);
+    this.rebuildLobbyUi();
+
     this.api.transmit({ type: "ready", ready: this.localReady, name: this.localName });
 
-    this.rebuildLobbyUi();
     if (this.isHost) this.maybeStartCountdown();
   }
 
   leaveLobby() {
-    this.game?.stop();
-    this.game = null;
+    if (this.api) this.api.leave();
 
-    this.api?.leave();
+    this.stopMultiplayerMatch();
 
-    this.isHost = false;
+    this.api = null;
     this.sessionId = null;
     this.clientId = null;
+    this.isHost = false;
     this.players.clear();
     this.localReady = false;
 
-    this.ui?.hideLobby();
-    this.ui?.setCountdown("");
     this.ui?.setLobbyCode("");
+    this.ui?.setCountdown("");
+    this.ui?.hideLobby();
+
+    console.log("[MP] left lobby");
   }
 
   onJoined(clientId) {
@@ -175,6 +196,7 @@ export class MultiplayerController {
 
   onLeft(clientId) {
     if (!clientId) return;
+
     this.players.delete(clientId);
 
     if (this.isHost) {
@@ -186,6 +208,7 @@ export class MultiplayerController {
   }
 
   onClosed() {
+    console.log("[MP] session closed by server");
     this.leaveLobby();
   }
 
@@ -193,22 +216,24 @@ export class MultiplayerController {
     if (!data || typeof data !== "object") return;
 
     switch (data.type) {
-      case "lobby_state":
-        if (this.isHost) return;
-        this.applyLobbyState(data);
-        break;
-
       case "lobby_sync_request":
         if (!this.isHost) return;
         this.broadcastLobbyState();
         break;
 
+      case "lobby_state":
+        if (this.isHost) return;
+        this.applyLobbyState(data);
+        break;
+
       case "ready":
         if (!this.isHost) return;
-        const p = this.players.get(fromClientId);
-        if (p) {
-          p.ready = !!data.ready;
-          if (typeof data.name === "string" && data.name.trim()) p.name = data.name.trim();
+        {
+          const p = this.players.get(fromClientId);
+          if (p) {
+            p.ready = !!data.ready;
+            if (typeof data.name === "string" && data.name.trim()) p.name = data.name.trim();
+          }
         }
         this.rebuildLobbyUi();
         this.broadcastLobbyState();
@@ -221,7 +246,10 @@ export class MultiplayerController {
         break;
 
       case "start_game":
-        this.startMultiplayerGameClient(data);
+        // === CRITICAL FIX ===
+        // Host får ofta tillbaka sin egen broadcast. Ignorera så host inte startar som client på sig själv.
+        if (this.isHost) return;
+        this.startMultiplayerMatchClient(data);
         break;
 
       case "input":
@@ -235,9 +263,21 @@ export class MultiplayerController {
         break;
 
       case "end":
-        this.handleGameEnd(data);
+        this.handleMatchEnd(data);
         break;
     }
+  }
+
+  rebuildLobbyUi() {
+    if (!this.ui) return;
+
+    const list = Array.from(this.players.entries()).map(([cid, p]) => ({
+      name: p.name,
+      ready: !!p.ready,
+      isHost: this.isHost ? cid === this.clientId : false,
+    }));
+
+    this.ui.setLobbyPlayers(list);
   }
 
   assignSlotsHostSide() {
@@ -249,7 +289,7 @@ export class MultiplayerController {
   }
 
   broadcastLobbyState() {
-    if (!this.isHost || !this.api) return;
+    if (!this.isHost || !this.isInMultiplayerSession()) return;
 
     this.assignSlotsHostSide();
 
@@ -278,38 +318,47 @@ export class MultiplayerController {
       });
     }
 
+    const me = this.players.get(this.clientId);
+    if (me) me.name = this.localName;
+
     this.rebuildLobbyUi();
   }
 
   maybeStartCountdown() {
-    if (!this.isHost || !this.api) return;
+    if (!this.isHost || !this.isInMultiplayerSession()) return;
+    if (this.game?.isRunning) return;
 
     const list = Array.from(this.players.values());
     if (list.length < 2) return;
     if (!list.every((p) => p.ready)) return;
-    if (this.game?.isRunning) return;
 
     let seconds = 5;
     this.ui?.setCountdown(`Starting in ${seconds}…`);
     this.api.transmit({ type: "countdown", seconds });
 
-    const timer = setInterval(() => {
+    const t = setInterval(() => {
       seconds -= 1;
       if (seconds > 0) {
         this.ui?.setCountdown(`Starting in ${seconds}…`);
         this.api.transmit({ type: "countdown", seconds });
         return;
       }
-      clearInterval(timer);
-      this.startMultiplayerGameHost();
+      clearInterval(t);
+      this.startMultiplayerMatchHost();
     }, 1000);
   }
 
-  startMultiplayerGameHost() {
-    if (!this.isHost || !this.api) return;
+  startMultiplayerMatchHost() {
+    if (!this.isHost || !this.isInMultiplayerSession()) return;
 
-    this.assignSlotsHostSide();
-    this.broadcastLobbyState();
+    this.singleGame.isRunning = false;
+    this.singleGame.setRenderEnabled(false);
+
+    const payloadPlayers = Array.from(this.players.entries()).map(([cid, p]) => ({
+      clientId: cid,
+      name: p.name,
+      slot: p.slot,
+    }));
 
     this.game = new MultiplayerGame({
       mode: "host",
@@ -318,9 +367,9 @@ export class MultiplayerController {
       players: this.players,
       hostClientId: this.clientId,
       onBroadcastState: (state) => this.api.transmit({ type: "state", state }),
-      onEnd: (payload) => {
-        this.api.transmit({ type: "end", ...payload });
-        this.handleGameEnd({ type: "end", ...payload });
+      onEnd: (result) => {
+        this.api.transmit({ type: "end", ...result });
+        this.handleMatchEnd({ type: "end", ...result });
       },
     });
 
@@ -328,11 +377,7 @@ export class MultiplayerController {
       type: "start_game",
       sessionId: this.sessionId,
       hostClientId: this.clientId,
-      players: Array.from(this.players.entries()).map(([cid, p]) => ({
-        clientId: cid,
-        name: p.name,
-        slot: p.slot,
-      })),
+      players: payloadPlayers,
     });
 
     this.ui?.hideLobby();
@@ -341,11 +386,12 @@ export class MultiplayerController {
     this.game.start();
   }
 
-  startMultiplayerGameClient(data) {
-    const players = Array.isArray(data.players) ? data.players : [];
+  startMultiplayerMatchClient(data) {
+    this.singleGame.isRunning = false;
+    this.singleGame.setRenderEnabled(false);
+
     this.players.clear();
-    for (const p of players) {
-      if (!p?.clientId) continue;
+    for (const p of data.players ?? []) {
       this.players.set(p.clientId, {
         name: p.name ?? `Player-${String(p.clientId).slice(-4)}`,
         ready: false,
@@ -360,22 +406,24 @@ export class MultiplayerController {
       players: this.players,
       hostClientId: data.hostClientId,
       onBroadcastState: null,
-      onEnd: (payload) => this.handleGameEnd({ type: "end", ...payload }),
+      onEnd: (result) => this.handleMatchEnd({ type: "end", ...result }),
     });
 
     this.ui?.hideLobby();
     this.ui?.setCountdown("");
+
     this.game.start();
   }
 
-  handleKeyDown(key) {
-    if (!this.api || !this.sessionId) return;
-    this.api.transmit({ type: "input", key });
-  }
-
-  handleGameEnd(data) {
+  stopMultiplayerMatch() {
     this.game?.stop();
     this.game = null;
+
+    this.singleGame.setRenderEnabled(true);
+  }
+
+  handleMatchEnd(data) {
+    this.stopMultiplayerMatch();
 
     this.ui?.showWinnerBoard({
       winnerName: data.winnerName,
@@ -384,6 +432,21 @@ export class MultiplayerController {
 
     for (const p of this.players.values()) p.ready = false;
     this.localReady = false;
+    this.ui?.setReadyButtonState(false);
     this.rebuildLobbyUi();
+  }
+
+  // === CRITICAL FIX 2: host input lokalt, clients via server ===
+  handleKeyDown(key) {
+    if (!this.isInMultiplayerSession()) return;
+
+    // Om host och matchen kör: applicera direkt (minskar lagg/jitter)
+    if (this.isHost && this.game?.isRunning) {
+      this.game.applyRemoteInput(this.clientId, key);
+      return;
+    }
+
+    // Clients: skicka till host via server
+    this.api.transmit({ type: "input", key });
   }
 }

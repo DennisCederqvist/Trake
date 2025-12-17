@@ -29,8 +29,7 @@ export class Game {
     this.foods = [];
     this.score = 0;
 
-    // Hastighet + paus
-    this.baseMoveDuration = 120; // ms per steg (baseline)
+    this.baseMoveDuration = 120;
     this.moveDuration = this.baseMoveDuration;
     this.isRunning = false;
 
@@ -52,11 +51,22 @@ export class Game {
       respawnMaxMs: POWERUP_RESPAWN_MAX_MS,
     });
 
+    // === PATCH: multiplayer kan tillfälligt stänga av singleplayer-render ===
+    this.renderEnabled = true;
+
     this.reset();
     this.startLoop();
   }
 
+  // === PATCH ===
+  setRenderEnabled(enabled) {
+    this.renderEnabled = !!enabled;
+  }
+
   startGame() {
+    // Om multiplayer har stängt av render: slå på igen när du startar singleplayer
+    this.setRenderEnabled(true);
+
     this.reset();
     this.isRunning = true;
   }
@@ -84,6 +94,9 @@ export class Game {
       startDirection: startDir,
       colorHead: "#d783ff",
       colorHeadStroke: "#b300ff",
+
+      // OBS: Renderern kör cyan i singleplayer ändå (och multiplayer styr via mpColor).
+      // Vi låter snake färger vara som de är för att inte röra din gameplay-logik.
       colorBody: "#4dff4d",
       tailScale: 0.6,
     });
@@ -94,7 +107,6 @@ export class Game {
     this.foods = [];
     this.spawnInitialFood();
 
-    // powerups: reset + spawn initial set
     this.powerUps.reset();
     this.powerUps.initSpawn((x, y) => this.isCellBlocked(x, y));
 
@@ -148,11 +160,11 @@ export class Game {
 
   schedulePowerRespawn() {
     const tokenAtSchedule = this.powerSpawnToken;
-    const delay = POWERUP_RESPAWN_MIN_MS + Math.random() * (POWERUP_RESPAWN_MAX_MS - POWERUP_RESPAWN_MIN_MS);
+    const delay =
+      POWERUP_RESPAWN_MIN_MS + Math.random() * (POWERUP_RESPAWN_MAX_MS - POWERUP_RESPAWN_MIN_MS);
 
     setTimeout(() => {
       if (tokenAtSchedule !== this.powerSpawnToken) return;
-      // se till att vi fyller på tillbaka till max
       this.powerUps.ensureSpawn((x, y) => this.isCellBlocked(x, y));
     }, delay);
   }
@@ -166,11 +178,8 @@ export class Game {
 
   getSpeedMultiplier(now) {
     let mult = 1.0;
-
     if (this.powerUps.isActive(PowerUpType.SPEED)) mult *= EFFECT.SPEED_MULT;
     if (this.powerUps.isActive(PowerUpType.SLOW)) mult *= EFFECT.SLOW_MULT;
-
-    // clamp lite så vi inte får helt vansinnig speed
     return Math.max(0.35, Math.min(3.0, mult));
   }
 
@@ -181,17 +190,15 @@ export class Game {
     this.lastTime = timestamp;
     this.now = timestamp;
 
-    // paus: rita bara, inga timers tickar
+    // paus: rita bara om vi får
     if (!this.isRunning) {
-      this.render(this.moveProgress);
+      if (this.renderEnabled) this.render(this.moveProgress);
       requestAnimationFrame(this.loop.bind(this));
       return;
     }
 
-    // timers/effects
     this.powerUps.update(timestamp);
 
-    // hastighet från effekter
     const mult = this.getSpeedMultiplier(timestamp);
     this.moveDuration = this.baseMoveDuration / mult;
 
@@ -202,7 +209,7 @@ export class Game {
       this.tick();
     }
 
-    this.render(this.moveProgress);
+    if (this.renderEnabled) this.render(this.moveProgress);
     requestAnimationFrame(this.loop.bind(this));
   }
 
@@ -212,13 +219,11 @@ export class Game {
     this.snake.step();
     const head = this.snake.segments[0];
 
-    // Väggkollision (ghost går INTE genom väggar)
     if (head.x < 0 || head.x >= this.cols || head.y < 0 || head.y >= this.rows) {
       this.handleDeath();
       return;
     }
 
-    // Egen kropp (ghost ignorerar self-collision)
     const isGhost = this.powerUps.isActive(PowerUpType.GHOST);
     if (!isGhost) {
       for (let i = 1; i < this.snake.segments.length; i++) {
@@ -230,33 +235,25 @@ export class Game {
       }
     }
 
-    // Powerup pickup
     const picked = this.powerUps.collectAt(head.x, head.y);
     if (picked) {
       switch (picked.type) {
         case PowerUpType.SPEED:
           this.powerUps.activate(PowerUpType.SPEED, this.now, EFFECT.SPEED_MS);
           break;
-
         case PowerUpType.SLOW:
-          // Singleplayer: du blir slowad (multiplayer: applicera på motståndare)
           this.powerUps.activate(PowerUpType.SLOW, this.now, EFFECT.SLOW_MS);
           break;
-
         case PowerUpType.GHOST:
           this.powerUps.activate(PowerUpType.GHOST, this.now, EFFECT.GHOST_MS);
           break;
-
         case PowerUpType.SHRINK:
           this.snake.shrink(EFFECT.SHRINK_AMOUNT, EFFECT.MIN_SNAKE_LEN);
           break;
       }
-
-      // respawn av powerup efter kort delay
       this.schedulePowerRespawn();
     }
 
-    // Matkollision
     const eatenIndex = this.foods.findIndex((f) => f.x === head.x && f.y === head.y);
     if (eatenIndex !== -1) {
       this.snake.grow();
@@ -290,6 +287,7 @@ export class Game {
       snakes: [
         {
           segments: segmentsToDraw,
+          // Renderern i singleplayer kör cyan ändå – dessa lämnas för kompat.
           colorHead: this.snake.colorHead,
           colorHeadStroke: this.snake.colorHeadStroke,
           colorBody: this.snake.colorBody,
@@ -301,7 +299,6 @@ export class Game {
     this.renderer.render(state);
   }
 
-  // ==== INPUT ====
   handleKeyDown(key) {
     switch (key) {
       case "ArrowUp":
