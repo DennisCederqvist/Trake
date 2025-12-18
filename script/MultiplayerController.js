@@ -206,8 +206,11 @@ export class MultiplayerController {
     this.ui?.setCountdown("");
     this.ui?.hideLobby();
 
+    // ✅ tillbaka till startsidan (Trake 'em + Singleplayer/Multiplayer)
+    this.ui?.showStartScreen();
+
     console.log("[MP] left lobby");
-  }
+}
 
   onJoined(clientId) {
     if (!clientId) return;
