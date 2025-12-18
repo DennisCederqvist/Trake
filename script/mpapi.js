@@ -1,5 +1,10 @@
+const WINDOW_MS = 4000;
+const TICK_MS = 1000;
 
 export class mpapi {
+
+
+
 	constructor(serverUrl, identifier) {
 		this.serverUrl = serverUrl;
 		this.identifier = identifier;
@@ -10,6 +15,11 @@ export class mpapi {
 
 		this.onHost = null;
 		this.onJoin = null;
+
+		this.stats = {
+			tx: new this.statsC("TX"),
+			rx: new this.statsC("RX")
+		}
 
 		this._connect();
 	}
@@ -37,6 +47,8 @@ export class mpapi {
 
 
 		this.socket.addEventListener('message', (event) => {
+			this.stats.rx.tick(1, event.data.byteLength ? event.data.byteLength : event.data.length);
+
 			let payload;
 			try {
 				payload = JSON.parse(event.data);
@@ -90,7 +102,7 @@ export class mpapi {
 					this.onList(data);
 
 			} else if (cmd === 'joined' || cmd === 'left' || cmd === 'closed' || cmd === 'game') {
-				console.log(`Received ${cmd} command`);
+				//console.log(`Received ${cmd} command`);
 
 				this.listeners.forEach((listener) => {
 					try {
@@ -114,6 +126,8 @@ export class mpapi {
 	}
 
 	_enqueueOrSend(serializedMessage) {
+		this.stats.tx.tick(1, serializedMessage.byteLength ? serializedMessage.length : 0);
+
 		if (this.socket && this.socket.readyState === WebSocket.OPEN) {
 			this.socket.send(serializedMessage);
 		} else {
@@ -215,5 +229,53 @@ export class mpapi {
 		return () => {
 			this.listeners.delete(callback);
 		};
+	}
+
+
+	statsC = class {
+
+		constructor(_Type) {
+			this.type = _Type;
+
+			this._events = [];
+			this._packetSum = 0;
+			this._byteSum = 0;
+			this._next = 0;
+
+			this.avgPacketsPerSec = 0;
+			this.avgBytesPerSec = 0;
+
+			this._startRateTimer();
+		}
+
+		_startRateTimer() {
+			this._rateTimer = setInterval(() => {
+				const now = performance.now();
+				const cutoff = now - WINDOW_MS;
+
+				// evict old events
+				while (this._events.length && this._events[0].t < cutoff) {
+					const e = this._events.shift();
+					this._packetSum -= e.packets;
+					this._byteSum -= e.bytes;
+				}
+
+				// update rates
+				const seconds = WINDOW_MS / 1000;
+				this.avgPacketsPerSec = this._packetSum / seconds;
+				this.avgBytesPerSec = this._byteSum / seconds;
+
+				console.log(this.type + ` ${this.avgPacketsPerSec.toFixed(2)}pkts/sec ${this.avgBytesPerSec.toFixed(2)}bytes/sec`);
+			}, TICK_MS);
+		}
+
+		tick(_Packets, _Bytes) {
+			const now = performance.now();
+
+			// record event only
+			this._events.push({ t: now, packets: _Packets, bytes: _Bytes });
+			this._packetSum += _Packets;
+			this._byteSum += _Bytes;
+		}
 	}
 }
