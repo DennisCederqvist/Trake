@@ -37,9 +37,6 @@ export class MultiplayerGame {
     this.moveDuration = this.baseMoveDuration;
     this.moveProgress = 0;
 
-    // host: last broadcast interval (used by clients to interpolate)
-    this.lastBroadcastMoveDuration = this.baseMoveDuration;
-
     this.foods = [];
     this.powerUps = new PowerUpManager({
       cols: this.cols,
@@ -64,9 +61,6 @@ export class MultiplayerGame {
     this.isRunning = true;
     this.lastTime = performance.now();
     this.moveProgress = 0;
-
-    // host: last broadcast interval (used by clients to interpolate)
-    this.lastBroadcastMoveDuration = this.baseMoveDuration;
 
     if (this.mode === "host") {
       this.resetHostWorld();
@@ -104,37 +98,16 @@ export class MultiplayerGame {
     this.lastTime = t;
 
     if (this.mode === "host") {
-      // Update effect timers continuously so SPEED/SLOW/GHOST expire on time
-      for (const entry of this.snakes.values()) {
-        entry.effects.update(t);
+      this.moveProgress += delta / this.moveDuration;
+
+      // Tick in discrete steps
+      while (this.moveProgress >= 1) {
+        this.moveProgress -= 1;
+        this.tickHost(t);
       }
 
-      // Update powerup spawns continuously
-      this.powerUps.update(t);
-
-      // Accumulate per-snake movement progress (different snakes can have different speeds)
-      for (const entry of this.snakes.values()) {
-        if (!entry.alive) continue;
-
-        const mult = this.getSpeedMultiplier(entry);
-        const dur = Math.max(40, this.baseMoveDuration / mult);
-
-        entry.moveDuration = dur;
-        entry.moveProgress = (entry.moveProgress ?? 0) + delta / dur;
-      }
-
-      // Process discrete "micro-ticks" for any snake(s) that are ready to move
-      let safety = 0;
-      while (this.anySnakeReadyToStep() && safety++ < 10) {
-        const stepIds = [];
-        for (const [cid, entry] of this.snakes.entries()) {
-          if (entry.alive && (entry.moveProgress ?? 0) >= 1) stepIds.push(cid);
-        }
-        this.tickHost(t, stepIds);
-      }
-
-      // Host render: interpolate per-snake between lastSegments and current segments
-      const renderState = this.buildInterpolatedRenderState();
+      // Host render: interpolate between last tick and current snake segments
+      const renderState = this.buildInterpolatedRenderState(this.moveProgress);
       this.renderer.render(renderState);
     } else {
       // Client render: interpolate between prev and curr tick states
@@ -181,8 +154,6 @@ export class MultiplayerGame {
           respawnMaxMs: 0,
         }),
         // for interpolation on host
-        moveDuration: this.baseMoveDuration,
-        moveProgress: 0,
         lastSegments: snake.segments.map((s) => ({ ...s })),
       });
     }
@@ -207,31 +178,10 @@ export class MultiplayerGame {
     return Array.from({ length: n }, (_, i) => pts[i] ?? pts[0]);
   }
 
-
-  getSpeedMultiplier(entry) {
-    let mult = 1;
-    if (entry.effects.isActive(PowerUpType.SPEED)) mult *= EFFECT.SPEED_MULT;
-    if (entry.effects.isActive(PowerUpType.SLOW)) mult *= EFFECT.SLOW_MULT;
-    return mult;
-  }
-
-  anySnakeReadyToStep() {
-    for (const entry of this.snakes.values()) {
-      if (entry.alive && (entry.moveProgress ?? 0) >= 1) return true;
-    }
-    return false;
-  }
-  tickHost(now, stepIds = null) {
+  tickHost(now) {
     this.tickId += 1;
 
-    // tell clients roughly how long until the next movement for interpolation
-    if (stepIds && stepIds.length) {
-      const durs = stepIds.map((cid) => Number(this.snakes.get(cid)?.moveDuration ?? this.baseMoveDuration));
-      this.lastBroadcastMoveDuration = Math.max(40, Math.min(...durs));
-    } else {
-      this.lastBroadcastMoveDuration = this.baseMoveDuration;
-    }
-
+    this.powerUps.update(now);
 
     // apply inputs (queued since last tick)
     for (const [cid, key] of this.pendingKeys.entries()) {
@@ -247,21 +197,14 @@ export class MultiplayerGame {
     this.pendingKeys.clear();
 
     // snapshot before moving (for host interpolation only)
-    const stepSet = stepIds ? new Set(stepIds) : null;
-    for (const [cid, entry] of this.snakes.entries()) {
+    for (const entry of this.snakes.values()) {
       if (!entry.alive) continue;
-      if (stepSet && !stepSet.has(cid)) continue;
       entry.lastSegments = entry.snake.segments.map((s) => ({ ...s }));
     }
 
-    // move only snakes that are ready this micro-tick
-    for (const [cid, entry] of this.snakes.entries()) {
-      if (!entry.alive) continue;
-      if (stepSet && !stepSet.has(cid)) continue;
-      entry.snake.step();
-
-      // consume one step worth of progress so speeds stay smooth
-      entry.moveProgress = Math.max(0, Number(entry.moveProgress ?? 0) - 1);
+    // move all alive snakes
+    for (const entry of this.snakes.values()) {
+      if (entry.alive) entry.snake.step();
     }
 
     // collisions + pickups
@@ -289,7 +232,6 @@ export class MultiplayerGame {
         if (!entry.alive) continue;
       }
 
-      if (!ghost) {
       // collision with others (incl. head-on)
       for (const [oid, other] of this.snakes.entries()) {
         if (!other.alive) continue;
@@ -307,7 +249,6 @@ export class MultiplayerGame {
       }
       if (!entry.alive) continue;
 
-      }
       // powerups
       const picked = this.powerUps.collectAt(head.x, head.y);
       if (picked) {
@@ -354,8 +295,6 @@ export class MultiplayerGame {
       const slot = this.players.get(cid)?.slot ?? 1;
       const c = colorsForSlot(slot);
 
-      const progress = Math.max(0, Math.min(1, Number(entry.moveProgress ?? 0)));
-
       // tick state is integer grid segments (no interpolation)
       snakes.push({
         clientId: cid,
@@ -375,7 +314,7 @@ export class MultiplayerGame {
 
     return {
       tickId: this.tickId,
-      moveDuration: this.lastBroadcastMoveDuration,
+      moveDuration: this.moveDuration,
       snakes,
       foods: this.foods,
       powerUps: this.powerUps.powerUps,
@@ -383,7 +322,7 @@ export class MultiplayerGame {
     };
   }
 
-  buildInterpolatedRenderState() {
+  buildInterpolatedRenderState(progress) {
     // host rendering: smooth between lastSegments and current segments
     const snakes = [];
 
@@ -392,8 +331,6 @@ export class MultiplayerGame {
 
       const slot = this.players.get(cid)?.slot ?? 1;
       const c = colorsForSlot(slot);
-
-      const progress = Math.max(0, Math.min(1, Number(entry.moveProgress ?? 0)));
 
       const cur = entry.snake.segments;
       const last = entry.lastSegments ?? cur;
