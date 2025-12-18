@@ -28,7 +28,8 @@ window.addEventListener("load", () => {
     event.preventDefault();
 
     if (mp.isInMultiplayerSession()) {
-      mp.handleKeyDown(event.key);
+      // Skicka event så MP kan ignorera auto-repeat korrekt
+      mp.handleKeyDown(event);
     } else {
       game.handleKeyDown(event.key);
     }

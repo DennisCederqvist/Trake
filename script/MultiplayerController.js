@@ -23,7 +23,9 @@ export class MultiplayerController {
     this.localName = "Player";
 
     this.game = null;
-    this._lastSentKey = null; // throttle repeated keydown spam
+
+    // countdown lifecycle (FIX)
+    this._countdownInterval = null;
 
     if (this.ui) {
       this.ui.onMpHostRequest = (name) => this.hostLobby(name);
@@ -54,8 +56,23 @@ export class MultiplayerController {
     console.log("[MP] api created");
   }
 
+  // ================= COUNTDOWN (FIX) =================
+
+  clearCountdown() {
+    if (this._countdownInterval) {
+      clearInterval(this._countdownInterval);
+      this._countdownInterval = null;
+    }
+  }
+
+  // ================= LOBBY =================
+
   async hostLobby(name) {
     this.ensureApi();
+
+    // Om du redan sitter i en session och försöker hosta igen: städa upp först
+    this.clearCountdown();
+    this.stopMultiplayerMatch();
 
     this.isHost = true;
     this.localReady = false;
@@ -101,6 +118,9 @@ export class MultiplayerController {
 
     this.ensureApi();
 
+    this.clearCountdown();
+    this.stopMultiplayerMatch();
+
     this.isHost = false;
     this.localReady = false;
     this.localName = (name || "Player").trim() || "Player";
@@ -144,6 +164,9 @@ export class MultiplayerController {
   toggleReady() {
     if (!this.isInMultiplayerSession()) return;
 
+    // Om readiness ändras: stoppa ev. pågående countdown (FIX)
+    if (this.isHost) this.clearCountdown();
+
     this.localReady = !this.localReady;
 
     const me = this.players.get(this.clientId);
@@ -155,12 +178,19 @@ export class MultiplayerController {
     this.ui?.setReadyButtonState(this.localReady);
     this.rebuildLobbyUi();
 
-    this.api.transmit({ type: "ready", sessionId: this.sessionId, ready: this.localReady, name: this.localName });
+    this.api.transmit({
+      type: "ready",
+      sessionId: this.sessionId,
+      ready: this.localReady,
+      name: this.localName,
+    });
 
     if (this.isHost) this.maybeStartCountdown();
   }
 
   leaveLobby() {
+    this.clearCountdown();
+
     if (this.api) this.api.leave();
 
     this.stopMultiplayerMatch();
@@ -187,6 +217,7 @@ export class MultiplayerController {
     }
 
     if (this.isHost) {
+      this.clearCountdown(); // ändrad player-list -> stoppa countdown (FIX)
       this.assignSlotsHostSide();
       this.broadcastLobbyState();
       this.maybeStartCountdown();
@@ -201,6 +232,7 @@ export class MultiplayerController {
     this.players.delete(clientId);
 
     if (this.isHost) {
+      this.clearCountdown(); // ändrad player-list -> stoppa countdown (FIX)
       this.assignSlotsHostSide();
       this.broadcastLobbyState();
     }
@@ -238,6 +270,9 @@ export class MultiplayerController {
         }
         this.rebuildLobbyUi();
         this.broadcastLobbyState();
+
+        // readiness ändras -> starta ev countdown på nytt (FIX)
+        this.clearCountdown();
         this.maybeStartCountdown();
         break;
 
@@ -247,8 +282,7 @@ export class MultiplayerController {
         break;
 
       case "start_game":
-        // === CRITICAL FIX ===
-        // Host får ofta tillbaka sin egen broadcast. Ignorera så host inte startar som client på sig själv.
+        // Host får ofta tillbaka sin egen broadcast. Ignorera.
         if (this.isHost) return;
         this.startMultiplayerMatchClient(data);
         break;
@@ -333,18 +367,34 @@ export class MultiplayerController {
     if (list.length < 2) return;
     if (!list.every((p) => p.ready)) return;
 
+    // Starta aldrig två countdowns samtidigt (FIX)
+    if (this._countdownInterval) return;
+
     let seconds = 5;
     this.ui?.setCountdown(`Starting in ${seconds}…`);
     this.api.transmit({ type: "countdown", sessionId: this.sessionId, seconds });
 
-    const t = setInterval(() => {
+    this._countdownInterval = setInterval(() => {
       seconds -= 1;
+
+      // Om någon hunnit unready under tiden: avbryt (FIX)
+      const stillAllReady = Array.from(this.players.values()).length >= 2 &&
+        Array.from(this.players.values()).every((p) => p.ready);
+
+      if (!stillAllReady) {
+        this.clearCountdown();
+        this.ui?.setCountdown("");
+        this.api.transmit({ type: "countdown", sessionId: this.sessionId, seconds: 0 });
+        return;
+      }
+
       if (seconds > 0) {
         this.ui?.setCountdown(`Starting in ${seconds}…`);
         this.api.transmit({ type: "countdown", sessionId: this.sessionId, seconds });
         return;
       }
-      clearInterval(t);
+
+      this.clearCountdown();
       this.startMultiplayerMatchHost();
     }, 1000);
   }
@@ -352,7 +402,7 @@ export class MultiplayerController {
   startMultiplayerMatchHost() {
     if (!this.isHost || !this.isInMultiplayerSession()) return;
 
-    this._lastSentKey = null;
+    this.clearCountdown(); // FIX: garanterat inga läckande timers
 
     this.singleGame.isRunning = false;
     this.singleGame.setRenderEnabled(false);
@@ -390,7 +440,7 @@ export class MultiplayerController {
   }
 
   startMultiplayerMatchClient(data) {
-    this._lastSentKey = null;
+    this.clearCountdown(); // FIX: ifall server spam/duplicerat
 
     this.singleGame.isRunning = false;
     this.singleGame.setRenderEnabled(false);
@@ -421,9 +471,10 @@ export class MultiplayerController {
   }
 
   stopMultiplayerMatch() {
+    this.clearCountdown();
+
     this.game?.stop();
     this.game = null;
-    this._lastSentKey = null; // throttle repeated keydown spam
 
     this.singleGame.setRenderEnabled(true);
   }
@@ -442,21 +493,25 @@ export class MultiplayerController {
     this.rebuildLobbyUi();
   }
 
-  // === CRITICAL FIX 2: host input lokalt, clients via server ===
-  handleKeyDown(key) {
+  // ================= INPUT (FIX) =================
+  // Nu tar vi emot antingen "ArrowUp" eller ett KeyboardEvent
+  handleKeyDown(keyOrEvent) {
     if (!this.isInMultiplayerSession()) return;
 
-    // Stoppa browser key-repeat från att spamma nätet (håller bandbredden låg)
-    if (this._lastSentKey === key) return;
-    this._lastSentKey = key;
+    const key = typeof keyOrEvent === "string" ? keyOrEvent : keyOrEvent?.key;
 
-    // Om host och matchen kör: applicera direkt (minskar lagg/jitter)
+    if (!key) return;
+
+    // Ignorera browserns auto-repeat, men låt samma knapp skickas igen vid nya tryck
+    if (typeof keyOrEvent !== "string" && keyOrEvent?.repeat) return;
+
+    // Host: applicera direkt för mindre lagg/jitter
     if (this.isHost && this.game?.isRunning) {
       this.game.applyRemoteInput(this.clientId, key);
       return;
     }
 
-    // Clients: skicka till host via server (alltid med sessionId)
+    // Client: skicka till host via server
     this.api.transmit({ type: "input", sessionId: this.sessionId, key });
   }
 }
