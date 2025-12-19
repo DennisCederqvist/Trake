@@ -64,7 +64,7 @@ export class mpapi {
 				return;
 			}
 
-			console.log('Received payload:', payload);
+			//console.log('Received payload:', payload);
 
 
 			const cmd = payload.cmd;
@@ -265,7 +265,7 @@ export class mpapi {
 				this.avgPacketsPerSec = this._packetSum / seconds;
 				this.avgBytesPerSec = this._byteSum / seconds;
 
-				console.log(this.type + ` ${this.avgPacketsPerSec.toFixed(2)}pkts/sec ${this.avgBytesPerSec.toFixed(2)}bytes/sec`);
+				//console.log(this.type + ` ${this.avgPacketsPerSec.toFixed(2)}pkts/sec ${this.avgBytesPerSec.toFixed(2)}bytes/sec`);
 			}, TICK_MS);
 		}
 
