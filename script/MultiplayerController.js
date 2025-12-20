@@ -18,7 +18,7 @@ export class MultiplayerController {
     this.clientId = null;
     this.isHost = false;
 
-    this.players = new Map();
+    this.players = new Map(); // clientId -> { name, ready, slot }
     this.localReady = false;
     this.localName = "Player";
 
@@ -26,12 +26,34 @@ export class MultiplayerController {
 
     this._countdownInterval = null;
 
+    // ✅ NEW: client-side state coalescing (kills “sticky lag”)
+    this._pendingState = null;   // latest received state
+    this._stateRafId = 0;        // requestAnimationFrame id (0 = none)
+
     if (this.ui) {
       this.ui.onMpHostRequest = (name) => this.hostLobby(name);
       this.ui.onMpJoinRequest = (code, name) => this.joinLobby(code, name);
       this.ui.onMpReadyToggle = () => this.toggleReady();
       this.ui.onMpLeave = () => this.leaveLobby();
     }
+
+    console.log("[MP] controller ready");
+  }
+
+  // ✅ NEW
+  _scheduleApplyLatestState() {
+    if (this._stateRafId) return;
+
+    this._stateRafId = requestAnimationFrame(() => {
+      this._stateRafId = 0;
+
+      const state = this._pendingState;
+      this._pendingState = null;
+
+      if (state && !this.isHost) {
+        this.game?.applyRemoteState(state);
+      }
+    });
   }
 
   isInMultiplayerSession() {
@@ -49,7 +71,11 @@ export class MultiplayerController {
       else if (cmd === "closed") this.onClosed();
       else if (cmd === "game") this.onGameMessage(clientId, data);
     });
+
+    console.log("[MP] api created");
   }
+
+  // ================= COUNTDOWN =================
 
   clearCountdown() {
     if (this._countdownInterval) {
@@ -57,6 +83,8 @@ export class MultiplayerController {
       this._countdownInterval = null;
     }
   }
+
+  // ================= LOBBY =================
 
   async hostLobby(name) {
     this.ensureApi();
@@ -68,6 +96,8 @@ export class MultiplayerController {
     this.localReady = false;
     this.localName = (name || "Player").trim() || "Player";
 
+    console.log("[MP] hosting as", this.localName);
+
     let res;
     try {
       res = await this.api.host({ name: this.localName, private: true });
@@ -76,7 +106,10 @@ export class MultiplayerController {
       return;
     }
 
-    if (!res?.session || !res?.clientId) return;
+    if (!res?.session || !res?.clientId) {
+      console.error("[MP] host response invalid", res);
+      return;
+    }
 
     this.sessionId = res.session;
     this.clientId = res.clientId;
@@ -93,6 +126,8 @@ export class MultiplayerController {
 
     this.assignSlotsHostSide();
     this.broadcastLobbyState();
+
+    console.log("[MP] host ok, session:", this.sessionId);
   }
 
   async joinLobby(code, name) {
@@ -108,6 +143,8 @@ export class MultiplayerController {
     this.localReady = false;
     this.localName = (name || "Player").trim() || "Player";
 
+    console.log("[MP] joining", session, "as", this.localName);
+
     let res;
     try {
       res = await this.api.join(session, { name: this.localName });
@@ -116,7 +153,10 @@ export class MultiplayerController {
       return;
     }
 
-    if (!res?.session || !res?.clientId) return;
+    if (!res?.session || !res?.clientId) {
+      console.error("[MP] join response invalid", res);
+      return;
+    }
 
     this.sessionId = res.session;
     this.clientId = res.clientId;
@@ -134,6 +174,8 @@ export class MultiplayerController {
     this.rebuildLobbyUi();
 
     this.api.transmit({ type: "lobby_sync_request", sessionId: this.sessionId });
+
+    console.log("[MP] join ok, session:", this.sessionId);
   }
 
   toggleReady() {
@@ -176,10 +218,17 @@ export class MultiplayerController {
     this.players.clear();
     this.localReady = false;
 
+    // ✅ also clear any pending state / raf
+    this._pendingState = null;
+    if (this._stateRafId) cancelAnimationFrame(this._stateRafId);
+    this._stateRafId = 0;
+
     this.ui?.setLobbyCode("");
     this.ui?.setCountdown("");
     this.ui?.hideLobby();
     this.ui?.showStartScreen();
+
+    console.log("[MP] left lobby");
   }
 
   onJoined(clientId) {
@@ -214,6 +263,7 @@ export class MultiplayerController {
   }
 
   onClosed() {
+    console.log("[MP] session closed by server");
     this.leaveLobby();
   }
 
@@ -264,7 +314,10 @@ export class MultiplayerController {
 
       case "state":
         if (this.isHost) return;
-        this.game?.applyRemoteState(data.state);
+
+        // ✅ BIG FIX: don’t apply every state; keep only the latest and apply once per frame
+        this._pendingState = data.state;
+        this._scheduleApplyLatestState();
         break;
 
       case "end":
@@ -388,7 +441,6 @@ export class MultiplayerController {
       scoreElement: this.scoreElement,
       players: this.players,
       hostClientId: this.clientId,
-      localClientId: this.clientId,
       onBroadcastState: (state) => this.api.transmit({ type: "state", sessionId: this.sessionId, state }),
       onEnd: (result) => {
         this.api.transmit({ type: "end", sessionId: this.sessionId, ...result });
@@ -424,13 +476,17 @@ export class MultiplayerController {
       });
     }
 
+    // ✅ clear any pending state (fresh start)
+    this._pendingState = null;
+    if (this._stateRafId) cancelAnimationFrame(this._stateRafId);
+    this._stateRafId = 0;
+
     this.game = new MultiplayerGame({
       mode: "client",
       canvas: this.canvas,
       scoreElement: this.scoreElement,
       players: this.players,
       hostClientId: data.hostClientId,
-      localClientId: this.clientId,
       onBroadcastState: null,
       onEnd: (result) => this.handleMatchEnd({ type: "end", ...result }),
     });
@@ -443,9 +499,16 @@ export class MultiplayerController {
 
   stopMultiplayerMatch() {
     this.clearCountdown();
+
     this.game?.stop();
     this.game = null;
+
     this.singleGame.setRenderEnabled(true);
+
+    // ✅ stop pending state apply
+    this._pendingState = null;
+    if (this._stateRafId) cancelAnimationFrame(this._stateRafId);
+    this._stateRafId = 0;
   }
 
   handleMatchEnd(data) {
