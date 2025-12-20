@@ -24,7 +24,7 @@ export class MultiplayerGame {
 
     this.renderer = new Renderer(this.canvas, this.cols, this.rows, this.cellSize);
 
-    this.players = players; // Map clientId -> {name, ready, slot}
+    this.players = players;
     this.hostClientId = hostClientId;
 
     this.onBroadcastState = onBroadcastState;
@@ -34,10 +34,6 @@ export class MultiplayerGame {
     this.lastTime = null;
 
     this.baseMoveDuration = 120;
-    this.moveDuration = this.baseMoveDuration;
-    this.moveProgress = 0;
-
-    // host: last broadcast interval (used by clients to interpolate)
     this.lastBroadcastMoveDuration = this.baseMoveDuration;
 
     this.foods = [];
@@ -50,37 +46,47 @@ export class MultiplayerGame {
     });
 
     // host only
-    this.snakes = new Map(); // clientId -> { snake, score, alive, effects, moveDuration, moveProgress, lastSegments }
+    this.snakes = new Map();
     this.pendingKeys = new Map();
     this.tickId = 0;
 
     // =========================
-    // HOST: broadcast throttle (THIS is the big fix)
+    // HOST: broadcast throttle (prevents backlog)
     // =========================
-    this.broadcastIntervalMs = 66; // ~15 updates/sec (safe). Try 50 for ~20/sec if you want snappier.
+    this.broadcastIntervalMs = 50; // ~20 updates/sec (smoother than 15)
     this._lastBroadcastAt = 0;
 
     // =========================
-    // CLIENT: smoothing / jitter buffer
+    // CLIENT: jitter buffer (THIS fixes stutter)
     // =========================
-    this.prevTickState = null;
-    this.currTickState = null;
+    this._stateBuf = [];          // [{ state, t }]
+    this._maxBuf = 8;
 
-    this.tickReceivedAt = 0;
-    this.avgArrivalMs = 120;  // EMA of inter-arrival time
-    this.renderBufferMs = 35; // render a bit behind to hide jitter
+    this.avgArrivalMs = 80;       // EMA of inter-arrival
+    this._lastRecvAt = 0;
+
+    // Render behind realtime by this delay (dynamic)
+    this.renderDelayMs = 120;     // start point; adjusts with jitter
+
+    // Caps for render delay
+    this._minDelay = 70;
+    this._maxDelay = 220;
   }
 
   start() {
     this.isRunning = true;
     this.lastTime = performance.now();
-    this.moveProgress = 0;
-
     this.lastBroadcastMoveDuration = this.baseMoveDuration;
 
     if (this.mode === "host") {
       this._lastBroadcastAt = 0;
       this.resetHostWorld();
+    } else {
+      // client
+      this._stateBuf.length = 0;
+      this.avgArrivalMs = 80;
+      this._lastRecvAt = 0;
+      this.renderDelayMs = 120;
     }
 
     requestAnimationFrame(this.loop.bind(this));
@@ -90,34 +96,44 @@ export class MultiplayerGame {
     this.isRunning = false;
   }
 
+  // ================= INPUT =================
   applyRemoteInput(clientId, key) {
     if (this.mode !== "host") return;
     this.pendingKeys.set(clientId, key);
   }
 
+  // ================= STATE SYNC =================
   applyRemoteState(state) {
     if (this.mode !== "client") return;
     if (!state || typeof state !== "object") return;
     if (typeof state.tickId !== "number") return;
 
-    // Only accept newer ticks
-    if (this.currTickState && state.tickId <= this.currTickState.tickId) return;
-
     const now = performance.now();
 
-    // Update EMA of arrival intervals
-    if (this.tickReceivedAt) {
-      const interval = now - this.tickReceivedAt;
-      const clamped = Math.max(20, Math.min(400, interval));
+    // Drop out-of-order
+    const last = this._stateBuf[this._stateBuf.length - 1]?.state;
+    if (last && state.tickId <= last.tickId) return;
+
+    // EMA of arrival intervals
+    if (this._lastRecvAt) {
+      const dt = now - this._lastRecvAt;
+      const clamped = Math.max(15, Math.min(350, dt));
       this.avgArrivalMs = this.avgArrivalMs * 0.85 + clamped * 0.15;
     }
+    this._lastRecvAt = now;
 
-    this.prevTickState = this.currTickState;
-    this.currTickState = state;
-    this.tickReceivedAt = now;
+    // Dynamic delay: more jitter => bigger delay, but capped
+    // 1.6 * avgArrival is usually enough to hide packet jitter
+    const targetDelay = Math.max(this._minDelay, Math.min(this._maxDelay, this.avgArrivalMs * 1.6));
+    this.renderDelayMs = this.renderDelayMs * 0.9 + targetDelay * 0.1;
 
-    // Dynamic-ish buffer: bigger jitter => bigger buffer, but capped
-    this.renderBufferMs = Math.max(20, Math.min(90, this.avgArrivalMs * 0.25));
+    // Push into buffer
+    this._stateBuf.push({ state, t: now });
+
+    // Keep only last N
+    if (this._stateBuf.length > this._maxBuf) {
+      this._stateBuf.splice(0, this._stateBuf.length - this._maxBuf);
+    }
   }
 
   loop(t) {
@@ -127,15 +143,9 @@ export class MultiplayerGame {
     this.lastTime = t;
 
     if (this.mode === "host") {
-      // Update effect timers continuously
-      for (const entry of this.snakes.values()) {
-        entry.effects.update(t);
-      }
-
-      // Update powerup spawns continuously
+      for (const entry of this.snakes.values()) entry.effects.update(t);
       this.powerUps.update(t);
 
-      // Accumulate per-snake movement progress (different snakes can have different speeds)
       for (const entry of this.snakes.values()) {
         if (!entry.alive) continue;
 
@@ -146,7 +156,6 @@ export class MultiplayerGame {
         entry.moveProgress = (entry.moveProgress ?? 0) + delta / dur;
       }
 
-      // Process discrete "micro-ticks" for any snake(s) ready to move
       let safety = 0;
       while (this.anySnakeReadyToStep() && safety++ < 10) {
         const stepIds = [];
@@ -156,14 +165,12 @@ export class MultiplayerGame {
         this.tickHost(t, stepIds);
       }
 
-      // Host render: interpolate per-snake between lastSegments and current segments
       const renderState = this.buildInterpolatedRenderState();
       this.renderer.render(renderState);
 
-      // ✅ broadcast latest state on a fixed rate (prevents backlog lag)
       this.maybeBroadcastTickState(t);
     } else {
-      const renderState = this.buildClientInterpolatedState();
+      const renderState = this.buildClientBufferedState();
       this.renderer.render(renderState);
     }
 
@@ -171,7 +178,6 @@ export class MultiplayerGame {
   }
 
   // ================= HOST =================
-
   resetHostWorld() {
     this.foods = [];
     this.snakes.clear();
@@ -198,13 +204,7 @@ export class MultiplayerGame {
         snake,
         score: 0,
         alive: true,
-        effects: new PowerUpManager({
-          cols: this.cols,
-          rows: this.rows,
-          maxCount: 0,
-          respawnMinMs: 0,
-          respawnMaxMs: 0,
-        }),
+        effects: new PowerUpManager({ cols: this.cols, rows: this.rows, maxCount: 0, respawnMinMs: 0, respawnMaxMs: 0 }),
         moveDuration: this.baseMoveDuration,
         moveProgress: 0,
         lastSegments: snake.segments.map((s) => ({ ...s })),
@@ -216,7 +216,6 @@ export class MultiplayerGame {
     this.powerUps.reset();
     this.powerUps.initSpawn((x, y) => this.isCellBlockedHost(x, y));
 
-    // Force an initial snapshot immediately
     this.forceBroadcastTickState(performance.now());
   }
 
@@ -248,7 +247,6 @@ export class MultiplayerGame {
   tickHost(now, stepIds = null) {
     this.tickId += 1;
 
-    // For info/debug/compat only — client interpolation no longer relies on this heavily
     if (stepIds && stepIds.length) {
       const durs = stepIds.map((cid) => Number(this.snakes.get(cid)?.moveDuration ?? this.baseMoveDuration));
       this.lastBroadcastMoveDuration = Math.max(40, Math.min(...durs));
@@ -256,7 +254,6 @@ export class MultiplayerGame {
       this.lastBroadcastMoveDuration = this.baseMoveDuration;
     }
 
-    // apply inputs (queued since last tick)
     for (const [cid, key] of this.pendingKeys.entries()) {
       const entry = this.snakes.get(cid);
       if (!entry?.alive) continue;
@@ -269,7 +266,6 @@ export class MultiplayerGame {
     }
     this.pendingKeys.clear();
 
-    // snapshot before moving (for host interpolation only)
     const stepSet = stepIds ? new Set(stepIds) : null;
     for (const [cid, entry] of this.snakes.entries()) {
       if (!entry.alive) continue;
@@ -277,7 +273,6 @@ export class MultiplayerGame {
       entry.lastSegments = entry.snake.segments.map((s) => ({ ...s }));
     }
 
-    // move only snakes that are ready to move
     for (const [cid, entry] of this.snakes.entries()) {
       if (!entry.alive) continue;
       if (stepSet && !stepSet.has(cid)) continue;
@@ -286,19 +281,16 @@ export class MultiplayerGame {
       entry.moveProgress = Math.max(0, Number(entry.moveProgress ?? 0) - 1);
     }
 
-    // collisions + pickups
     for (const [cid, entry] of this.snakes.entries()) {
       if (!entry.alive) continue;
 
       const head = entry.snake.segments[0];
 
-      // walls
       if (head.x < 0 || head.x >= this.cols || head.y < 0 || head.y >= this.rows) {
         entry.alive = false;
         continue;
       }
 
-      // self collision (unless ghost)
       const ghost = entry.effects.isActive(PowerUpType.GHOST);
       if (!ghost) {
         for (let i = 1; i < entry.snake.segments.length; i++) {
@@ -312,7 +304,6 @@ export class MultiplayerGame {
       }
 
       if (!ghost) {
-        // collision with others
         for (const [oid, other] of this.snakes.entries()) {
           if (!other.alive) continue;
 
@@ -330,7 +321,6 @@ export class MultiplayerGame {
         if (!entry.alive) continue;
       }
 
-      // powerups
       const picked = this.powerUps.collectAt(head.x, head.y);
       if (picked) {
         if (picked.type === PowerUpType.SPEED) entry.effects.activate(PowerUpType.SPEED, now, EFFECT.SPEED_MS);
@@ -344,7 +334,6 @@ export class MultiplayerGame {
         this.powerUps.ensureSpawn((x, y) => this.isCellBlockedHost(x, y));
       }
 
-      // food
       const idx = this.foods.findIndex((f) => f.x === head.x && f.y === head.y);
       if (idx !== -1) {
         entry.snake.grow();
@@ -478,8 +467,6 @@ export class MultiplayerGame {
 
   endGameHost() {
     this.isRunning = false;
-
-    // Force final state out so clients don't "freeze" on stale state
     this.forceBroadcastTickState(performance.now());
 
     const scores = Array.from(this.snakes.entries()).map(([cid, e]) => ({
@@ -494,23 +481,40 @@ export class MultiplayerGame {
     this.onEnd?.({ winnerName: winner?.name ?? "Winner", scores });
   }
 
-  // ================= CLIENT =================
-
-  buildClientInterpolatedState() {
-    if (!this.currTickState) return { snakes: [], foods: [], powerUps: [], scores: [] };
-    if (!this.prevTickState) return this.currTickState;
+  // ================= CLIENT: buffered render =================
+  buildClientBufferedState() {
+    if (this._stateBuf.length === 0) return { snakes: [], foods: [], powerUps: [], scores: [] };
+    if (this._stateBuf.length === 1) return this._stateBuf[0].state;
 
     const now = performance.now();
+    const renderTime = now - this.renderDelayMs;
 
-    // Use EMA of packet arrivals instead of moveDuration (speed/slow breaks moveDuration-based interpolation)
-    const interpMs = Math.max(40, Math.min(250, this.avgArrivalMs || 120));
+    // Find two buffer entries surrounding renderTime
+    let a = null;
+    let b = null;
 
-    // Render behind newest tick to hide jitter
-    const dt = (now - this.tickReceivedAt) - this.renderBufferMs;
-    const alpha = Math.max(0, Math.min(1, dt / interpMs));
+    for (let i = 0; i < this._stateBuf.length - 1; i++) {
+      const cur = this._stateBuf[i];
+      const next = this._stateBuf[i + 1];
+      if (cur.t <= renderTime && renderTime <= next.t) {
+        a = cur;
+        b = next;
+        break;
+      }
+    }
 
-    const prevSnakes = new Map((this.prevTickState.snakes ?? []).map((s) => [s.clientId, s]));
-    const currSnakes = new Map((this.currTickState.snakes ?? []).map((s) => [s.clientId, s]));
+    // If renderTime is newer than everything, use last two (slight extrapolation but clamped)
+    if (!a || !b) {
+      a = this._stateBuf[this._stateBuf.length - 2];
+      b = this._stateBuf[this._stateBuf.length - 1];
+    }
+
+    const span = Math.max(1, b.t - a.t);
+    let alpha = (renderTime - a.t) / span;
+    alpha = Math.max(0, Math.min(1, alpha));
+
+    const prevSnakes = new Map((a.state.snakes ?? []).map((s) => [s.clientId, s]));
+    const currSnakes = new Map((b.state.snakes ?? []).map((s) => [s.clientId, s]));
 
     const snakes = [];
     for (const [cid, cur] of currSnakes.entries()) {
@@ -529,17 +533,14 @@ export class MultiplayerGame {
         };
       });
 
-      snakes.push({
-        ...cur,
-        segments: segs,
-      });
+      snakes.push({ ...cur, segments: segs });
     }
 
     return {
       snakes,
-      foods: this.currTickState.foods ?? [],
-      powerUps: this.currTickState.powerUps ?? [],
-      scores: this.currTickState.scores ?? [],
+      foods: b.state.foods ?? [],
+      powerUps: b.state.powerUps ?? [],
+      scores: b.state.scores ?? [],
     };
   }
 }
