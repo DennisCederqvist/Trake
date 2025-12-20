@@ -18,13 +18,12 @@ export class MultiplayerController {
     this.clientId = null;
     this.isHost = false;
 
-    this.players = new Map(); // clientId -> { name, ready, slot }
+    this.players = new Map();
     this.localReady = false;
     this.localName = "Player";
 
     this.game = null;
 
-    // countdown lifecycle (FIX)
     this._countdownInterval = null;
 
     if (this.ui) {
@@ -33,8 +32,6 @@ export class MultiplayerController {
       this.ui.onMpReadyToggle = () => this.toggleReady();
       this.ui.onMpLeave = () => this.leaveLobby();
     }
-
-    console.log("[MP] controller ready");
   }
 
   isInMultiplayerSession() {
@@ -52,11 +49,7 @@ export class MultiplayerController {
       else if (cmd === "closed") this.onClosed();
       else if (cmd === "game") this.onGameMessage(clientId, data);
     });
-
-    console.log("[MP] api created");
   }
-
-  // ================= COUNTDOWN (FIX) =================
 
   clearCountdown() {
     if (this._countdownInterval) {
@@ -65,20 +58,15 @@ export class MultiplayerController {
     }
   }
 
-  // ================= LOBBY =================
-
   async hostLobby(name) {
     this.ensureApi();
 
-    // Om du redan sitter i en session och försöker hosta igen: städa upp först
     this.clearCountdown();
     this.stopMultiplayerMatch();
 
     this.isHost = true;
     this.localReady = false;
     this.localName = (name || "Player").trim() || "Player";
-
-    console.log("[MP] hosting as", this.localName);
 
     let res;
     try {
@@ -88,10 +76,7 @@ export class MultiplayerController {
       return;
     }
 
-    if (!res?.session || !res?.clientId) {
-      console.error("[MP] host response invalid", res);
-      return;
-    }
+    if (!res?.session || !res?.clientId) return;
 
     this.sessionId = res.session;
     this.clientId = res.clientId;
@@ -108,8 +93,6 @@ export class MultiplayerController {
 
     this.assignSlotsHostSide();
     this.broadcastLobbyState();
-
-    console.log("[MP] host ok, session:", this.sessionId);
   }
 
   async joinLobby(code, name) {
@@ -125,8 +108,6 @@ export class MultiplayerController {
     this.localReady = false;
     this.localName = (name || "Player").trim() || "Player";
 
-    console.log("[MP] joining", session, "as", this.localName);
-
     let res;
     try {
       res = await this.api.join(session, { name: this.localName });
@@ -135,10 +116,7 @@ export class MultiplayerController {
       return;
     }
 
-    if (!res?.session || !res?.clientId) {
-      console.error("[MP] join response invalid", res);
-      return;
-    }
+    if (!res?.session || !res?.clientId) return;
 
     this.sessionId = res.session;
     this.clientId = res.clientId;
@@ -155,16 +133,12 @@ export class MultiplayerController {
     this.ui?.setReadyButtonState(false);
     this.rebuildLobbyUi();
 
-    // Be host om state
     this.api.transmit({ type: "lobby_sync_request", sessionId: this.sessionId });
-
-    console.log("[MP] join ok, session:", this.sessionId);
   }
 
   toggleReady() {
     if (!this.isInMultiplayerSession()) return;
 
-    // Om readiness ändras: stoppa ev. pågående countdown (FIX)
     if (this.isHost) this.clearCountdown();
 
     this.localReady = !this.localReady;
@@ -205,12 +179,8 @@ export class MultiplayerController {
     this.ui?.setLobbyCode("");
     this.ui?.setCountdown("");
     this.ui?.hideLobby();
-
-    // ✅ tillbaka till startsidan (Trake 'em + Singleplayer/Multiplayer)
     this.ui?.showStartScreen();
-
-    console.log("[MP] left lobby");
-}
+  }
 
   onJoined(clientId) {
     if (!clientId) return;
@@ -220,7 +190,7 @@ export class MultiplayerController {
     }
 
     if (this.isHost) {
-      this.clearCountdown(); // ändrad player-list -> stoppa countdown (FIX)
+      this.clearCountdown();
       this.assignSlotsHostSide();
       this.broadcastLobbyState();
       this.maybeStartCountdown();
@@ -235,7 +205,7 @@ export class MultiplayerController {
     this.players.delete(clientId);
 
     if (this.isHost) {
-      this.clearCountdown(); // ändrad player-list -> stoppa countdown (FIX)
+      this.clearCountdown();
       this.assignSlotsHostSide();
       this.broadcastLobbyState();
     }
@@ -244,7 +214,6 @@ export class MultiplayerController {
   }
 
   onClosed() {
-    console.log("[MP] session closed by server");
     this.leaveLobby();
   }
 
@@ -274,7 +243,6 @@ export class MultiplayerController {
         this.rebuildLobbyUi();
         this.broadcastLobbyState();
 
-        // readiness ändras -> starta ev countdown på nytt (FIX)
         this.clearCountdown();
         this.maybeStartCountdown();
         break;
@@ -285,7 +253,6 @@ export class MultiplayerController {
         break;
 
       case "start_game":
-        // Host får ofta tillbaka sin egen broadcast. Ignorera.
         if (this.isHost) return;
         this.startMultiplayerMatchClient(data);
         break;
@@ -370,7 +337,6 @@ export class MultiplayerController {
     if (list.length < 2) return;
     if (!list.every((p) => p.ready)) return;
 
-    // Starta aldrig två countdowns samtidigt (FIX)
     if (this._countdownInterval) return;
 
     let seconds = 5;
@@ -380,8 +346,8 @@ export class MultiplayerController {
     this._countdownInterval = setInterval(() => {
       seconds -= 1;
 
-      // Om någon hunnit unready under tiden: avbryt (FIX)
-      const stillAllReady = Array.from(this.players.values()).length >= 2 &&
+      const stillAllReady =
+        Array.from(this.players.values()).length >= 2 &&
         Array.from(this.players.values()).every((p) => p.ready);
 
       if (!stillAllReady) {
@@ -405,7 +371,7 @@ export class MultiplayerController {
   startMultiplayerMatchHost() {
     if (!this.isHost || !this.isInMultiplayerSession()) return;
 
-    this.clearCountdown(); // FIX: garanterat inga läckande timers
+    this.clearCountdown();
 
     this.singleGame.isRunning = false;
     this.singleGame.setRenderEnabled(false);
@@ -422,6 +388,7 @@ export class MultiplayerController {
       scoreElement: this.scoreElement,
       players: this.players,
       hostClientId: this.clientId,
+      localClientId: this.clientId,
       onBroadcastState: (state) => this.api.transmit({ type: "state", sessionId: this.sessionId, state }),
       onEnd: (result) => {
         this.api.transmit({ type: "end", sessionId: this.sessionId, ...result });
@@ -443,7 +410,7 @@ export class MultiplayerController {
   }
 
   startMultiplayerMatchClient(data) {
-    this.clearCountdown(); // FIX: ifall server spam/duplicerat
+    this.clearCountdown();
 
     this.singleGame.isRunning = false;
     this.singleGame.setRenderEnabled(false);
@@ -463,6 +430,7 @@ export class MultiplayerController {
       scoreElement: this.scoreElement,
       players: this.players,
       hostClientId: data.hostClientId,
+      localClientId: this.clientId,
       onBroadcastState: null,
       onEnd: (result) => this.handleMatchEnd({ type: "end", ...result }),
     });
@@ -475,10 +443,8 @@ export class MultiplayerController {
 
   stopMultiplayerMatch() {
     this.clearCountdown();
-
     this.game?.stop();
     this.game = null;
-
     this.singleGame.setRenderEnabled(true);
   }
 
@@ -496,25 +462,20 @@ export class MultiplayerController {
     this.rebuildLobbyUi();
   }
 
-  // ================= INPUT (FIX) =================
-  // Nu tar vi emot antingen "ArrowUp" eller ett KeyboardEvent
+  // ================= INPUT =================
   handleKeyDown(keyOrEvent) {
     if (!this.isInMultiplayerSession()) return;
 
     const key = typeof keyOrEvent === "string" ? keyOrEvent : keyOrEvent?.key;
-
     if (!key) return;
 
-    // Ignorera browserns auto-repeat, men låt samma knapp skickas igen vid nya tryck
     if (typeof keyOrEvent !== "string" && keyOrEvent?.repeat) return;
 
-    // Host: applicera direkt för mindre lagg/jitter
     if (this.isHost && this.game?.isRunning) {
       this.game.applyRemoteInput(this.clientId, key);
       return;
     }
 
-    // Client: skicka till host via server
     this.api.transmit({ type: "input", sessionId: this.sessionId, key });
   }
 }

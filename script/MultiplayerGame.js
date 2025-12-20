@@ -13,7 +13,16 @@ import { Renderer } from "./Renderer.js";
 import { PowerUpManager, PowerUpType } from "./PowerUps.js";
 
 export class MultiplayerGame {
-  constructor({ mode, canvas, scoreElement, players, hostClientId, onBroadcastState, onEnd }) {
+  constructor({
+    mode,
+    canvas,
+    scoreElement,
+    players,
+    hostClientId,
+    localClientId = null,
+    onBroadcastState,
+    onEnd,
+  }) {
     this.mode = mode;
     this.canvas = canvas;
     this.scoreElement = scoreElement;
@@ -24,8 +33,9 @@ export class MultiplayerGame {
 
     this.renderer = new Renderer(this.canvas, this.cols, this.rows, this.cellSize);
 
-    this.players = players; // Map clientId -> {name, ready, slot}
+    this.players = players;
     this.hostClientId = hostClientId;
+    this.localClientId = localClientId;
 
     this.onBroadcastState = onBroadcastState;
     this.onEnd = onEnd;
@@ -36,8 +46,6 @@ export class MultiplayerGame {
     this.baseMoveDuration = 120;
     this.moveDuration = this.baseMoveDuration;
     this.moveProgress = 0;
-
-    // host: last broadcast interval (used by clients to interpolate)
     this.lastBroadcastMoveDuration = this.baseMoveDuration;
 
     this.foods = [];
@@ -49,23 +57,29 @@ export class MultiplayerGame {
       respawnMaxMs: POWERUP_RESPAWN_MAX_MS,
     });
 
-    // host only
-    this.snakes = new Map(); // clientId -> { snake, score, alive, effects }
+    // host
+    this.snakes = new Map();
     this.pendingKeys = new Map();
     this.tickId = 0;
 
-    // client smoothing
+    // client smoothing / jitter buffer
     this.prevTickState = null;
     this.currTickState = null;
-    this.tickReceivedAt = 0; // performance.now() when currTickState received
+
+    this.tickReceivedAt = 0;
+    this.prevTickReceivedAt = 0;
+    this.avgArrivalMs = 120;
+    this.renderBufferMs = 35;
+
+    // ✅ Prediction (disabled visually): we keep desiredDir only (no nudge)
+    this._localDesiredDir = null;
+    this._localDesiredUntil = 0;
   }
 
   start() {
     this.isRunning = true;
     this.lastTime = performance.now();
     this.moveProgress = 0;
-
-    // host: last broadcast interval (used by clients to interpolate)
     this.lastBroadcastMoveDuration = this.baseMoveDuration;
 
     if (this.mode === "host") {
@@ -84,17 +98,38 @@ export class MultiplayerGame {
     this.pendingKeys.set(clientId, key);
   }
 
+  // ✅ now: NO positional nudge. Just remember intent briefly (for future extension)
+  applyLocalPredictedInput(key) {
+    if (this.mode !== "client") return;
+    const dir = keyToDir(key);
+    if (!dir) return;
+
+    this._localDesiredDir = dir;
+    this._localDesiredUntil = performance.now() + 250;
+  }
+
   applyRemoteState(state) {
     if (this.mode !== "client") return;
     if (!state || typeof state !== "object") return;
     if (typeof state.tickId !== "number") return;
 
-    // Only accept newer ticks
     if (this.currTickState && state.tickId <= this.currTickState.tickId) return;
 
+    const now = performance.now();
+
+    if (this.tickReceivedAt) {
+      const interval = now - this.tickReceivedAt;
+      const clamped = Math.max(20, Math.min(400, interval));
+      this.avgArrivalMs = this.avgArrivalMs * 0.85 + clamped * 0.15;
+    }
+
     this.prevTickState = this.currTickState;
+    this.prevTickReceivedAt = this.tickReceivedAt;
+
     this.currTickState = state;
-    this.tickReceivedAt = performance.now();
+    this.tickReceivedAt = now;
+
+    this.renderBufferMs = Math.max(20, Math.min(90, this.avgArrivalMs * 0.25));
   }
 
   loop(t) {
@@ -104,15 +139,9 @@ export class MultiplayerGame {
     this.lastTime = t;
 
     if (this.mode === "host") {
-      // Update effect timers continuously so SPEED/SLOW/GHOST expire on time
-      for (const entry of this.snakes.values()) {
-        entry.effects.update(t);
-      }
-
-      // Update powerup spawns continuously
+      for (const entry of this.snakes.values()) entry.effects.update(t);
       this.powerUps.update(t);
 
-      // Accumulate per-snake movement progress (different snakes can have different speeds)
       for (const entry of this.snakes.values()) {
         if (!entry.alive) continue;
 
@@ -123,7 +152,6 @@ export class MultiplayerGame {
         entry.moveProgress = (entry.moveProgress ?? 0) + delta / dur;
       }
 
-      // Process discrete "micro-ticks" for any snake(s) that are ready to move
       let safety = 0;
       while (this.anySnakeReadyToStep() && safety++ < 10) {
         const stepIds = [];
@@ -133,11 +161,9 @@ export class MultiplayerGame {
         this.tickHost(t, stepIds);
       }
 
-      // Host render: interpolate per-snake between lastSegments and current segments
       const renderState = this.buildInterpolatedRenderState();
       this.renderer.render(renderState);
     } else {
-      // Client render: interpolate between prev and curr tick states
       const renderState = this.buildClientInterpolatedState();
       this.renderer.render(renderState);
     }
@@ -180,7 +206,6 @@ export class MultiplayerGame {
           respawnMinMs: 0,
           respawnMaxMs: 0,
         }),
-        // for interpolation on host
         moveDuration: this.baseMoveDuration,
         moveProgress: 0,
         lastSegments: snake.segments.map((s) => ({ ...s })),
@@ -192,7 +217,6 @@ export class MultiplayerGame {
     this.powerUps.reset();
     this.powerUps.initSpawn((x, y) => this.isCellBlockedHost(x, y));
 
-    // send first tick snapshot so clients have something immediately
     this.broadcastTickState();
   }
 
@@ -207,7 +231,6 @@ export class MultiplayerGame {
     return Array.from({ length: n }, (_, i) => pts[i] ?? pts[0]);
   }
 
-
   getSpeedMultiplier(entry) {
     let mult = 1;
     if (entry.effects.isActive(PowerUpType.SPEED)) mult *= EFFECT.SPEED_MULT;
@@ -221,10 +244,10 @@ export class MultiplayerGame {
     }
     return false;
   }
+
   tickHost(now, stepIds = null) {
     this.tickId += 1;
 
-    // tell clients roughly how long until the next movement for interpolation
     if (stepIds && stepIds.length) {
       const durs = stepIds.map((cid) => Number(this.snakes.get(cid)?.moveDuration ?? this.baseMoveDuration));
       this.lastBroadcastMoveDuration = Math.max(40, Math.min(...durs));
@@ -232,8 +255,6 @@ export class MultiplayerGame {
       this.lastBroadcastMoveDuration = this.baseMoveDuration;
     }
 
-
-    // apply inputs (queued since last tick)
     for (const [cid, key] of this.pendingKeys.entries()) {
       const entry = this.snakes.get(cid);
       if (!entry?.alive) continue;
@@ -246,7 +267,6 @@ export class MultiplayerGame {
     }
     this.pendingKeys.clear();
 
-    // snapshot before moving (for host interpolation only)
     const stepSet = stepIds ? new Set(stepIds) : null;
     for (const [cid, entry] of this.snakes.entries()) {
       if (!entry.alive) continue;
@@ -254,29 +274,24 @@ export class MultiplayerGame {
       entry.lastSegments = entry.snake.segments.map((s) => ({ ...s }));
     }
 
-    // move only snakes that are ready this micro-tick
     for (const [cid, entry] of this.snakes.entries()) {
       if (!entry.alive) continue;
       if (stepSet && !stepSet.has(cid)) continue;
-      entry.snake.step();
 
-      // consume one step worth of progress so speeds stay smooth
+      entry.snake.step();
       entry.moveProgress = Math.max(0, Number(entry.moveProgress ?? 0) - 1);
     }
 
-    // collisions + pickups
     for (const [cid, entry] of this.snakes.entries()) {
       if (!entry.alive) continue;
 
       const head = entry.snake.segments[0];
 
-      // walls
       if (head.x < 0 || head.x >= this.cols || head.y < 0 || head.y >= this.rows) {
         entry.alive = false;
         continue;
       }
 
-      // self collision (unless ghost)
       const ghost = entry.effects.isActive(PowerUpType.GHOST);
       if (!ghost) {
         for (let i = 1; i < entry.snake.segments.length; i++) {
@@ -290,25 +305,23 @@ export class MultiplayerGame {
       }
 
       if (!ghost) {
-      // collision with others (incl. head-on)
-      for (const [oid, other] of this.snakes.entries()) {
-        if (!other.alive) continue;
+        for (const [oid, other] of this.snakes.entries()) {
+          if (!other.alive) continue;
 
-        const segs = other.snake.segments;
-        const start = oid === cid ? 1 : 0;
-        for (let i = start; i < segs.length; i++) {
-          const seg = segs[i];
-          if (seg.x === head.x && seg.y === head.y) {
-            entry.alive = false;
-            break;
+          const segs = other.snake.segments;
+          const start = oid === cid ? 1 : 0;
+          for (let i = start; i < segs.length; i++) {
+            const seg = segs[i];
+            if (seg.x === head.x && seg.y === head.y) {
+              entry.alive = false;
+              break;
+            }
           }
+          if (!entry.alive) break;
         }
-        if (!entry.alive) break;
+        if (!entry.alive) continue;
       }
-      if (!entry.alive) continue;
 
-      }
-      // powerups
       const picked = this.powerUps.collectAt(head.x, head.y);
       if (picked) {
         if (picked.type === PowerUpType.SPEED) entry.effects.activate(PowerUpType.SPEED, now, EFFECT.SPEED_MS);
@@ -322,7 +335,6 @@ export class MultiplayerGame {
         this.powerUps.ensureSpawn((x, y) => this.isCellBlockedHost(x, y));
       }
 
-      // food
       const idx = this.foods.findIndex((f) => f.x === head.x && f.y === head.y);
       if (idx !== -1) {
         entry.snake.grow();
@@ -334,7 +346,6 @@ export class MultiplayerGame {
       entry.effects.update(now);
     }
 
-    // broadcast ONCE per tick (this is the stutter fix)
     this.broadcastTickState();
 
     const aliveCount = Array.from(this.snakes.values()).filter((e) => e.alive).length;
@@ -354,9 +365,6 @@ export class MultiplayerGame {
       const slot = this.players.get(cid)?.slot ?? 1;
       const c = colorsForSlot(slot);
 
-      const progress = Math.max(0, Math.min(1, Number(entry.moveProgress ?? 0)));
-
-      // tick state is integer grid segments (no interpolation)
       snakes.push({
         clientId: cid,
         segments: entry.snake.segments.map((s) => ({ x: s.x, y: s.y })),
@@ -384,7 +392,6 @@ export class MultiplayerGame {
   }
 
   buildInterpolatedRenderState() {
-    // host rendering: smooth between lastSegments and current segments
     const snakes = [];
 
     for (const [cid, entry] of this.snakes.entries()) {
@@ -468,18 +475,19 @@ export class MultiplayerGame {
   // ================= CLIENT =================
 
   buildClientInterpolatedState() {
-    // If we don't have enough states yet, render what we have
     if (!this.currTickState) return { snakes: [], foods: [], powerUps: [], scores: [] };
     if (!this.prevTickState) return this.currTickState;
 
     const now = performance.now();
-    const dt = now - this.tickReceivedAt;
 
-    // Slight buffer: we render "a bit behind" the latest tick to hide jitter.
-    const duration = Math.max(40, Number(this.currTickState.moveDuration ?? 120));
-    const alpha = Math.max(0, Math.min(1, dt / duration));
+    // Interpolation duration: use arrival EMA (works better than moveDuration when network jitters)
+    const hint = Math.max(40, Number(this.currTickState.moveDuration ?? 120));
+    const interpMs = Math.max(40, Math.min(250, this.avgArrivalMs || hint));
 
-    // interpolate snakes segment-by-segment between prevTickState and currTickState
+    // Render behind newest tick (buffer)
+    const dt = (now - this.tickReceivedAt) - this.renderBufferMs;
+    const alpha = Math.max(0, Math.min(1, dt / interpMs));
+
     const prevSnakes = new Map((this.prevTickState.snakes ?? []).map((s) => [s.clientId, s]));
     const currSnakes = new Map((this.currTickState.snakes ?? []).map((s) => [s.clientId, s]));
 
@@ -500,6 +508,7 @@ export class MultiplayerGame {
         };
       });
 
+      // ✅ NO visual prediction nudge here (that was the “hack on input”)
       snakes.push({
         ...cur,
         segments: segs,
@@ -520,4 +529,12 @@ function colorsForSlot(slot) {
   if (slot === 3) return { body: "rgba(80, 255, 80, 0.95)", glow: "rgba(80, 255, 80, 0.85)" };
   if (slot === 4) return { body: "rgba(255, 90, 90, 0.95)", glow: "rgba(255, 90, 90, 0.85)" };
   return { body: "rgba(200, 255, 255, 0.95)", glow: "rgba(0, 255, 255, 0.85)" };
+}
+
+function keyToDir(key) {
+  if (key === "ArrowUp") return { x: 0, y: -1 };
+  if (key === "ArrowDown") return { x: 0, y: 1 };
+  if (key === "ArrowLeft") return { x: -1, y: 0 };
+  if (key === "ArrowRight") return { x: 1, y: 0 };
+  return null;
 }
