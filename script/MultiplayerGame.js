@@ -66,7 +66,7 @@ export class MultiplayerGame {
 		this._maxDelay = 220;
 
 		this.onFrame = [];
-	}
+	} 
 
 	start() {
 		this.isRunning = true;
