@@ -2,317 +2,321 @@
 
 import { Snake } from "./Snake.js";
 import {
-  GRID_COLS,
-  GRID_ROWS,
-  CELL_SIZE,
-  FOOD_COUNT,
-  POWERUP_COUNT,
-  POWERUP_RESPAWN_MIN_MS,
-  POWERUP_RESPAWN_MAX_MS,
-  EFFECT,
+	GRID_COLS,
+	GRID_ROWS,
+	CELL_SIZE,
+	FOOD_COUNT,
+	POWERUP_COUNT,
+	POWERUP_RESPAWN_MIN_MS,
+	POWERUP_RESPAWN_MAX_MS,
+	EFFECT,
 } from "./Config.js";
 import { Renderer } from "./Renderer.js";
 import { PowerUpManager, PowerUpType } from "./PowerUps.js";
 
 export class Game {
-  constructor(canvas, scoreElement) {
-    this.canvas = canvas;
-    this.scoreElement = scoreElement;
+	constructor(canvas, scoreElement) {
+		this.canvas = canvas;
+		this.scoreElement = scoreElement;
 
-    this.cols = GRID_COLS;
-    this.rows = GRID_ROWS;
-    this.cellSize = CELL_SIZE;
+		this.cols = GRID_COLS;
+		this.rows = GRID_ROWS;
+		this.cellSize = CELL_SIZE;
 
-    this.renderer = new Renderer(this.canvas, this.cols, this.rows, this.cellSize);
+		this.renderer = new Renderer(this.canvas, this.cols, this.rows, this.cellSize);
 
-    this.snake = null;
-    this.foods = [];
-    this.score = 0;
+		this.snake = null;
+		this.foods = [];
+		this.score = 0;
 
-    this.baseMoveDuration = 120;
-    this.moveDuration = this.baseMoveDuration;
-    this.isRunning = false;
+		this.baseMoveDuration = 120;
+		this.moveDuration = this.baseMoveDuration;
+		this.isRunning = false;
 
-    this.lastSegments = null;
-    this.moveProgress = 0;
-    this.lastTime = null;
-    this.now = 0;
+		this.lastSegments = null;
+		this.moveProgress = 0;
+		this.lastTime = null;
+		this.now = 0;
 
-    this.foodSpawnToken = 0;
-    this.powerSpawnToken = 0;
+		this.foodSpawnToken = 0;
+		this.powerSpawnToken = 0;
 
-    this.onPlayerDeath = null;
+		this.onPlayerDeath = null;
 
-    this.powerUps = new PowerUpManager({
-      cols: this.cols,
-      rows: this.rows,
-      maxCount: POWERUP_COUNT,
-      respawnMinMs: POWERUP_RESPAWN_MIN_MS,
-      respawnMaxMs: POWERUP_RESPAWN_MAX_MS,
-    });
+		this.powerUps = new PowerUpManager({
+			cols: this.cols,
+			rows: this.rows,
+			maxCount: POWERUP_COUNT,
+			respawnMinMs: POWERUP_RESPAWN_MIN_MS,
+			respawnMaxMs: POWERUP_RESPAWN_MAX_MS,
+		});
 
-    // === PATCH: multiplayer kan tillfälligt stänga av singleplayer-render ===
-    this.renderEnabled = true;
+		// === PATCH: multiplayer kan tillfälligt stänga av singleplayer-render ===
+		this.renderEnabled = true;
 
-    this.reset();
-    this.startLoop();
-  }
+		this.reset();
+		this.startLoop();
 
-  // === PATCH ===
-  setRenderEnabled(enabled) {
-    this.renderEnabled = !!enabled;
-  }
+		this.onFrame = [];
+	}
 
-  startGame() {
-    // Om multiplayer har stängt av render: slå på igen när du startar singleplayer
-    this.setRenderEnabled(true);
+	// === PATCH ===
+	setRenderEnabled(enabled) {
+		this.renderEnabled = !!enabled;
+	}
 
-    this.reset();
-    this.isRunning = true;
-  }
+	startGame() {
+		// Om multiplayer har stängt av render: slå på igen när du startar singleplayer
+		this.setRenderEnabled(true);
 
-  setOnPlayerDeath(callback) {
-    this.onPlayerDeath = callback;
-  }
+		this.reset();
+		this.isRunning = true;
+	}
 
-  reset() {
-    this.foodSpawnToken++;
-    this.powerSpawnToken++;
+	setOnPlayerDeath(callback) {
+		this.onPlayerDeath = callback;
+	}
 
-    const dirs = [
-      { x: 1, y: 0 },
-      { x: -1, y: 0 },
-      { x: 0, y: -1 },
-      { x: 0, y: 1 },
-    ];
-    const startDir = dirs[Math.floor(Math.random() * dirs.length)];
+	reset() {
+		this.foodSpawnToken++;
+		this.powerSpawnToken++;
 
-    const startX = Math.floor(this.cols / 2);
-    const startY = Math.floor(this.rows / 2);
+		const dirs = [
+			{ x: 1, y: 0 },
+			{ x: -1, y: 0 },
+			{ x: 0, y: -1 },
+			{ x: 0, y: 1 },
+		];
+		const startDir = dirs[Math.floor(Math.random() * dirs.length)];
 
-    this.snake = new Snake(startX, startY, {
-      startDirection: startDir,
-      colorHead: "#d783ff",
-      colorHeadStroke: "#b300ff",
+		const startX = Math.floor(this.cols / 2);
+		const startY = Math.floor(this.rows / 2);
 
-      // OBS: Renderern kör cyan i singleplayer ändå (och multiplayer styr via mpColor).
-      // Vi låter snake färger vara som de är för att inte röra din gameplay-logik.
-      colorBody: "#4dff4d",
-      tailScale: 0.6,
-    });
+		this.snake = new Snake(startX, startY, {
+			startDirection: startDir,
+			colorHead: "#d783ff",
+			colorHeadStroke: "#b300ff",
 
-    this.score = 0;
-    this.updateScore();
+			// OBS: Renderern kör cyan i singleplayer ändå (och multiplayer styr via mpColor).
+			// Vi låter snake färger vara som de är för att inte röra din gameplay-logik.
+			colorBody: "#4dff4d",
+			tailScale: 0.6,
+		});
 
-    this.foods = [];
-    this.spawnInitialFood();
+		this.score = 0;
+		this.updateScore();
 
-    this.powerUps.reset();
-    this.powerUps.initSpawn((x, y) => this.isCellBlocked(x, y));
+		this.foods = [];
+		this.spawnInitialFood();
 
-    this.lastSegments = this.snake.segments.map((seg) => ({ ...seg }));
-    this.moveProgress = 0;
+		this.powerUps.reset();
+		this.powerUps.initSpawn((x, y) => this.isCellBlocked(x, y));
 
-    this.moveDuration = this.baseMoveDuration;
-  }
+		this.lastSegments = this.snake.segments.map((seg) => ({ ...seg }));
+		this.moveProgress = 0;
 
-  startLoop() {
-    this.lastTime = performance.now();
-    requestAnimationFrame(this.loop.bind(this));
-  }
+		this.moveDuration = this.baseMoveDuration;
+	}
 
-  updateScore() {
-    if (this.scoreElement) this.scoreElement.textContent = String(this.score);
-  }
+	startLoop() {
+		this.lastTime = performance.now();
+		requestAnimationFrame(this.loop.bind(this));
+	}
 
-  spawnInitialFood() {
-    for (let i = 0; i < FOOD_COUNT; i++) this.spawnFood();
-  }
+	updateScore() {
+		if (this.scoreElement) this.scoreElement.textContent = String(this.score);
+	}
 
-  spawnFood() {
-    if (this.foods.length >= FOOD_COUNT) return;
+	spawnInitialFood() {
+		for (let i = 0; i < FOOD_COUNT; i++) this.spawnFood();
+	}
 
-    for (let safety = 0; safety < 1000; safety++) {
-      const x = Math.floor(Math.random() * this.cols);
-      const y = Math.floor(Math.random() * this.rows);
+	spawnFood() {
+		if (this.foods.length >= FOOD_COUNT) return;
 
-      const onSnake = this.snake.segments.some((seg) => seg.x === x && seg.y === y);
-      const onFood = this.foods.some((f) => f.x === x && f.y === y);
-      const onPower = this.powerUps.powerUps.some((p) => p.x === x && p.y === y);
+		for (let safety = 0; safety < 1000; safety++) {
+			const x = Math.floor(Math.random() * this.cols);
+			const y = Math.floor(Math.random() * this.rows);
 
-      if (!onSnake && !onFood && !onPower) {
-        this.foods.push({ x, y });
-        return;
-      }
-    }
-  }
+			const onSnake = this.snake.segments.some((seg) => seg.x === x && seg.y === y);
+			const onFood = this.foods.some((f) => f.x === x && f.y === y);
+			const onPower = this.powerUps.powerUps.some((p) => p.x === x && p.y === y);
 
-  scheduleFoodRespawn() {
-    const tokenAtSchedule = this.foodSpawnToken;
-    const delay = 500 + Math.random() * 2500;
+			if (!onSnake && !onFood && !onPower) {
+				this.foods.push({ x, y });
+				return;
+			}
+		}
+	}
 
-    setTimeout(() => {
-      if (tokenAtSchedule !== this.foodSpawnToken) return;
-      if (this.foods.length >= FOOD_COUNT) return;
-      this.spawnFood();
-    }, delay);
-  }
+	scheduleFoodRespawn() {
+		const tokenAtSchedule = this.foodSpawnToken;
+		const delay = 500 + Math.random() * 2500;
 
-  schedulePowerRespawn() {
-    const tokenAtSchedule = this.powerSpawnToken;
-    const delay =
-      POWERUP_RESPAWN_MIN_MS + Math.random() * (POWERUP_RESPAWN_MAX_MS - POWERUP_RESPAWN_MIN_MS);
+		setTimeout(() => {
+			if (tokenAtSchedule !== this.foodSpawnToken) return;
+			if (this.foods.length >= FOOD_COUNT) return;
+			this.spawnFood();
+		}, delay);
+	}
 
-    setTimeout(() => {
-      if (tokenAtSchedule !== this.powerSpawnToken) return;
-      this.powerUps.ensureSpawn((x, y) => this.isCellBlocked(x, y));
-    }, delay);
-  }
+	schedulePowerRespawn() {
+		const tokenAtSchedule = this.powerSpawnToken;
+		const delay =
+			POWERUP_RESPAWN_MIN_MS + Math.random() * (POWERUP_RESPAWN_MAX_MS - POWERUP_RESPAWN_MIN_MS);
 
-  isCellBlocked(x, y) {
-    const onSnake = this.snake.segments.some((s) => s.x === x && s.y === y);
-    const onFood = this.foods.some((f) => f.x === x && f.y === y);
-    const onPower = this.powerUps.powerUps.some((p) => p.x === x && p.y === y);
-    return onSnake || onFood || onPower;
-  }
+		setTimeout(() => {
+			if (tokenAtSchedule !== this.powerSpawnToken) return;
+			this.powerUps.ensureSpawn((x, y) => this.isCellBlocked(x, y));
+		}, delay);
+	}
 
-  getSpeedMultiplier(now) {
-    let mult = 1.0;
-    if (this.powerUps.isActive(PowerUpType.SPEED)) mult *= EFFECT.SPEED_MULT;
-    if (this.powerUps.isActive(PowerUpType.SLOW)) mult *= EFFECT.SLOW_MULT;
-    return Math.max(0.35, Math.min(3.0, mult));
-  }
+	isCellBlocked(x, y) {
+		const onSnake = this.snake.segments.some((s) => s.x === x && s.y === y);
+		const onFood = this.foods.some((f) => f.x === x && f.y === y);
+		const onPower = this.powerUps.powerUps.some((p) => p.x === x && p.y === y);
+		return onSnake || onFood || onPower;
+	}
 
-  loop(timestamp) {
-    if (this.lastTime == null) this.lastTime = timestamp;
+	getSpeedMultiplier(now) {
+		let mult = 1.0;
+		if (this.powerUps.isActive(PowerUpType.SPEED)) mult *= EFFECT.SPEED_MULT;
+		if (this.powerUps.isActive(PowerUpType.SLOW)) mult *= EFFECT.SLOW_MULT;
+		return Math.max(0.35, Math.min(3.0, mult));
+	}
 
-    const delta = timestamp - this.lastTime;
-    this.lastTime = timestamp;
-    this.now = timestamp;
+	loop(timestamp) {
+		if (this.lastTime == null) this.lastTime = timestamp;
 
-    // paus: rita bara om vi får
-    if (!this.isRunning) {
-      if (this.renderEnabled) this.render(this.moveProgress);
-      requestAnimationFrame(this.loop.bind(this));
-      return;
-    }
+		const delta = timestamp - this.lastTime;
+		this.lastTime = timestamp;
+		this.now = timestamp;
 
-    this.powerUps.update(timestamp);
+		// paus: rita bara om vi får
+		if (!this.isRunning) {
+			if (this.renderEnabled) this.render(this.moveProgress);
+			requestAnimationFrame(this.loop.bind(this));
+			return;
+		}
 
-    const mult = this.getSpeedMultiplier(timestamp);
-    this.moveDuration = this.baseMoveDuration / mult;
+		this.powerUps.update(timestamp);
 
-    this.moveProgress += delta / this.moveDuration;
+		const mult = this.getSpeedMultiplier(timestamp);
+		this.moveDuration = this.baseMoveDuration / mult;
 
-    while (this.moveProgress >= 1) {
-      this.moveProgress -= 1;
-      this.tick();
-    }
+		this.moveProgress += delta / this.moveDuration;
 
-    if (this.renderEnabled) this.render(this.moveProgress);
-    requestAnimationFrame(this.loop.bind(this));
-  }
+		while (this.moveProgress >= 1) {
+			this.moveProgress -= 1;
+			this.tick();
+		}
 
-  tick() {
-    this.lastSegments = this.snake.segments.map((seg) => ({ ...seg }));
+		this.onFrame.forEach((cb) => cb(delta));
 
-    this.snake.step();
-    const head = this.snake.segments[0];
+		if (this.renderEnabled) this.render(this.moveProgress);
+		requestAnimationFrame(this.loop.bind(this));
+	}
 
-    if (head.x < 0 || head.x >= this.cols || head.y < 0 || head.y >= this.rows) {
-      this.handleDeath();
-      return;
-    }
+	tick() {
+		this.lastSegments = this.snake.segments.map((seg) => ({ ...seg }));
 
-    const isGhost = this.powerUps.isActive(PowerUpType.GHOST);
-    if (!isGhost) {
-      for (let i = 1; i < this.snake.segments.length; i++) {
-        const seg = this.snake.segments[i];
-        if (seg.x === head.x && seg.y === head.y) {
-          this.handleDeath();
-          return;
-        }
-      }
-    }
+		this.snake.step();
+		const head = this.snake.segments[0];
 
-    const picked = this.powerUps.collectAt(head.x, head.y);
-    if (picked) {
-      switch (picked.type) {
-        case PowerUpType.SPEED:
-          this.powerUps.activate(PowerUpType.SPEED, this.now, EFFECT.SPEED_MS);
-          break;
-        case PowerUpType.SLOW:
-          this.powerUps.activate(PowerUpType.SLOW, this.now, EFFECT.SLOW_MS);
-          break;
-        case PowerUpType.GHOST:
-          this.powerUps.activate(PowerUpType.GHOST, this.now, EFFECT.GHOST_MS);
-          break;
-        case PowerUpType.SHRINK:
-          this.snake.shrink(EFFECT.SHRINK_AMOUNT, EFFECT.MIN_SNAKE_LEN);
-          break;
-      }
-      this.schedulePowerRespawn();
-    }
+		if (head.x < 0 || head.x >= this.cols || head.y < 0 || head.y >= this.rows) {
+			this.handleDeath();
+			return;
+		}
 
-    const eatenIndex = this.foods.findIndex((f) => f.x === head.x && f.y === head.y);
-    if (eatenIndex !== -1) {
-      this.snake.grow();
-      this.score += 10;
-      this.updateScore();
+		const isGhost = this.powerUps.isActive(PowerUpType.GHOST);
+		if (!isGhost) {
+			for (let i = 1; i < this.snake.segments.length; i++) {
+				const seg = this.snake.segments[i];
+				if (seg.x === head.x && seg.y === head.y) {
+					this.handleDeath();
+					return;
+				}
+			}
+		}
 
-      this.foods.splice(eatenIndex, 1);
-      this.scheduleFoodRespawn();
-    }
-  }
+		const picked = this.powerUps.collectAt(head.x, head.y);
+		if (picked) {
+			switch (picked.type) {
+				case PowerUpType.SPEED:
+					this.powerUps.activate(PowerUpType.SPEED, this.now, EFFECT.SPEED_MS);
+					break;
+				case PowerUpType.SLOW:
+					this.powerUps.activate(PowerUpType.SLOW, this.now, EFFECT.SLOW_MS);
+					break;
+				case PowerUpType.GHOST:
+					this.powerUps.activate(PowerUpType.GHOST, this.now, EFFECT.GHOST_MS);
+					break;
+				case PowerUpType.SHRINK:
+					this.snake.shrink(EFFECT.SHRINK_AMOUNT, EFFECT.MIN_SNAKE_LEN);
+					break;
+			}
+			this.schedulePowerRespawn();
+		}
 
-  handleDeath() {
-    this.isRunning = false;
-    if (this.onPlayerDeath) this.onPlayerDeath({ score: this.score });
-  }
+		const eatenIndex = this.foods.findIndex((f) => f.x === head.x && f.y === head.y);
+		if (eatenIndex !== -1) {
+			this.snake.grow();
+			this.score += 10;
+			this.updateScore();
 
-  render(progress = 1) {
-    const segmentsToDraw = this.snake.segments.map((seg, index) => {
-      if (!this.lastSegments || !this.lastSegments[index]) return { x: seg.x, y: seg.y };
-      const prev = this.lastSegments[index];
-      return {
-        x: prev.x + (seg.x - prev.x) * progress,
-        y: prev.y + (seg.y - prev.y) * progress,
-      };
-    });
+			this.foods.splice(eatenIndex, 1);
+			this.scheduleFoodRespawn();
+		}
+	}
 
-    const state = {
-      foods: this.foods,
-      powerUps: this.powerUps.powerUps,
-      activeEffects: this.powerUps.activeEffects,
-      snakes: [
-        {
-          segments: segmentsToDraw,
-          // Renderern i singleplayer kör cyan ändå – dessa lämnas för kompat.
-          colorHead: this.snake.colorHead,
-          colorHeadStroke: this.snake.colorHeadStroke,
-          colorBody: this.snake.colorBody,
-          tailScale: this.snake.tailScale,
-        },
-      ],
-    };
+	handleDeath() {
+		this.isRunning = false;
+		if (this.onPlayerDeath) this.onPlayerDeath({ score: this.score });
+	}
 
-    this.renderer.render(state);
-  }
+	render(progress = 1) {
+		const segmentsToDraw = this.snake.segments.map((seg, index) => {
+			if (!this.lastSegments || !this.lastSegments[index]) return { x: seg.x, y: seg.y };
+			const prev = this.lastSegments[index];
+			return {
+				x: prev.x + (seg.x - prev.x) * progress,
+				y: prev.y + (seg.y - prev.y) * progress,
+			};
+		});
 
-  handleKeyDown(key) {
-    switch (key) {
-      case "ArrowUp":
-        this.snake.setDirection(0, -1);
-        break;
-      case "ArrowDown":
-        this.snake.setDirection(0, 1);
-        break;
-      case "ArrowLeft":
-        this.snake.setDirection(-1, 0);
-        break;
-      case "ArrowRight":
-        this.snake.setDirection(1, 0);
-        break;
-    }
-  }
+		const state = {
+			foods: this.foods,
+			powerUps: this.powerUps.powerUps,
+			activeEffects: this.powerUps.activeEffects,
+			snakes: [
+				{
+					segments: segmentsToDraw,
+					// Renderern i singleplayer kör cyan ändå – dessa lämnas för kompat.
+					colorHead: this.snake.colorHead,
+					colorHeadStroke: this.snake.colorHeadStroke,
+					colorBody: this.snake.colorBody,
+					tailScale: this.snake.tailScale,
+				},
+			],
+		};
+
+		this.renderer.render(state);
+	}
+
+	handleKeyDown(key) {
+		switch (key) {
+			case "ArrowUp":
+				this.snake.setDirection(0, -1);
+				break;
+			case "ArrowDown":
+				this.snake.setDirection(0, 1);
+				break;
+			case "ArrowLeft":
+				this.snake.setDirection(-1, 0);
+				break;
+			case "ArrowRight":
+				this.snake.setDirection(1, 0);
+				break;
+		}
+	}
 }
