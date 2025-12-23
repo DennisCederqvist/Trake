@@ -1,25 +1,35 @@
 // MultiplayerController.js
-// Målet:
-// - Self för joiners: lokal sim + lokal rendering (ingen input-lagg, buttery smooth)
-// - Host: sanningen för world (food/powerups), score, death/respawn, collisions
-// - Joiners: prediktera self-pickups (äta/växa känns direkt), men ALDRIG teleport-korrigera self position
+// Host-authoritative multiplayer + smooth rendering for joiners.
+// Key change in this drop-in:
+// ✅ Separate render delay for SELF vs OTHERS.
+//    - Self: near-zero delay => much less input lag.
+//    - Others + world: delayed => smooth (anti-jitter).
 //
-// Fixar dessutom:
-// 1) Lobby overlay ska vara kvar under countdown; göms när matchen startar.
-// 2) Join-side hack för ANDRA spelare: snapshot buffer (renderDelay) + interpolation.
-// 3) Winner-knappar: Single = leave session + start singleplayer direkt.
-//                 Multi = tillbaka till samma lobby i samma session (rematch), utan leave.
+// Keeps:
+// - Lobby overlay visible during countdown; hides when match starts.
+// - Winner buttons: Single => leave + start singleplayer, Multi => rematch same session.
 
 import { mpapi } from "./mpapi.js";
 import { Snake } from "./Snake.js";
-import { GRID_COLS, GRID_ROWS, FOOD_COUNT, POWERUP_COUNT, EFFECT } from "./Config.js";
+import {
+  GRID_COLS,
+  GRID_ROWS,
+  FOOD_COUNT,
+  POWERUP_COUNT,
+  EFFECT,
+} from "./Config.js";
 import { PowerUpType } from "./PowerUps.js";
 
 const MAX_PLAYERS = 4;
 
-const TICK_MS = 100; // 10 ticks/s logik
-const RENDER_DELAY_MS = 160; // smoothing för andra spelare på joiners
+// Logic tick
+const TICK_MS = 100; // 10 ticks/s
 
+// Render smoothing (joiners)
+const OTHERS_RENDER_DELAY_MS = 160; // keep smooth
+const SELF_RENDER_DELAY_MS = 0;     // ✅ minimize input lag for own snake
+
+// Match rules
 const MATCH_DURATION_MS = 180_000; // 3 min
 const RESPAWN_DELAY_MS = 3_000;
 const COUNTDOWN_MS = 3_000;
@@ -28,14 +38,11 @@ const MATCH_DURATION_TICKS = Math.ceil(MATCH_DURATION_MS / TICK_MS);
 const RESPAWN_DELAY_TICKS = Math.ceil(RESPAWN_DELAY_MS / TICK_MS);
 const COUNTDOWN_TICKS = Math.ceil(COUNTDOWN_MS / TICK_MS);
 
-// Liten TTL så att “lokalt uppätet” inte poppar tillbaka innan host snapshot hinner uppdatera world
-const LOCAL_CONSUME_TTL_HOST_TICKS = 20;
-
 const SLOT_COLORS = [
   { body: "#00ffff", glow: "rgba(0,255,255,0.35)" }, // host cyan
-  { body: "#ffd400", glow: "rgba(255,212,0,0.35)" }, // gul
-  { body: "#ff3b30", glow: "rgba(255,59,48,0.35)" }, // röd
-  { body: "#ff4fd8", glow: "rgba(255,79,216,0.35)" }, // rosa
+  { body: "#ffd400", glow: "rgba(255,212,0,0.35)" }, // yellow
+  { body: "#ff3b30", glow: "rgba(255,59,48,0.35)" }, // red
+  { body: "#ff4fd8", glow: "rgba(255,79,216,0.35)" }, // pink
 ];
 
 function getSlotSpawn(slot, cols, rows) {
@@ -53,7 +60,7 @@ function getSlotSpawn(slot, cols, rows) {
   }
 }
 
-// Deterministisk RNG (LCG) - host only
+// Deterministic RNG (host only)
 class RNG {
   constructor(seed) { this._seed = seed >>> 0; }
   nextU32() {
@@ -94,7 +101,7 @@ export class MultiplayerController {
     // Lobby/roster
     this.rosterIds = [];
     this.players = new Map(); // id -> {name,ready,score,isHost}
-    this.runtime = new Map(); // host sim
+    this.runtime = new Map(); // id -> runtime (host sim)
     this.localReady = false;
 
     // Match state
@@ -104,25 +111,23 @@ export class MultiplayerController {
     this.matchStartTick = null;
     this.matchEndTick = null;
 
-    // World (host truth copies for rendering + joiner pickup prediction)
+    // World (host truth)
     this.seed = (Date.now() ^ ((Math.random() * 0xffffffff) >>> 0)) >>> 0;
     this.rng = new RNG(this.seed);
     this.foods = [];
     this.powerUps = [];
 
-    // Snapshot buffer (for other players smoothing + world)
+    // Snapshot buffer (clients render from this)
+    // Each: { tick, receivedAt, snapshot }
     this._snapBuf = [];
 
-    // Host tick offset estimate on clients (effects timing only)
-    this._hostTickOffset = 0;
-    this._hostTickOffsetEwma = 0;
+    // Stable tick clock anchor for interpolation
+    this._lastSnapTick = 0;
+    this._lastSnapAt = 0;
 
-    // ✅ Joiners local self sim (buttery)
-    this._selfLocal = null; // see _createOrResetLocalSelfSnake
-    this._selfAwaitingRespawn = false;
-
-    // ✅ Hide locally-consumed world items until host confirms (avoid pop-back)
-    this._localConsumedUntilHostTick = new Map(); // key -> expireHostTick
+    // Render delay in ticks
+    this._othersDelayTicks = Math.max(1, Math.round(OTHERS_RENDER_DELAY_MS / TICK_MS));
+    this._selfDelayTicks = Math.max(0, Math.round(SELF_RENDER_DELAY_MS / TICK_MS));
 
     // Loops
     this._rafId = null;
@@ -200,17 +205,11 @@ export class MultiplayerController {
     const dir = keyToDir(key);
     if (!dir) return;
 
-    // ✅ Apply instantly for joiners (buttery)
-    if (!this.isHost && this._selfLocal?.alive) {
-      this._selfLocal.desiredDir = dir;
-      this._selfLocal.snake.setDirection(dir.x, dir.y);
-    }
-
-    // Host buffer
+    // Local desired direction (host uses it for sim; joiners keep it for responsiveness feel)
     const rt = this.runtime.get(this.selfId);
     if (rt) rt.desiredDir = dir;
 
-    // send to host for authoritative collision/pickups
+    // Send to host
     this.api.transmit({ type: "input", tick: this.tick, dir });
   }
 
@@ -232,7 +231,12 @@ export class MultiplayerController {
       this.selfId = res.clientId;
 
       this.rosterIds = [this.selfId];
-      this.players.set(this.selfId, { name: this.selfName, ready: false, score: 0, isHost: true });
+      this.players.set(this.selfId, {
+        name: this.selfName,
+        ready: false,
+        score: 0,
+        isHost: true,
+      });
 
       this._ensureRuntimeFor(this.selfId);
       this._rebuildWorldHost();
@@ -281,11 +285,9 @@ export class MultiplayerController {
             isHost: id === payload.host,
           });
         }
+        // Create runtime entries so self has desiredDir buffer, etc.
         this._ensureRuntimeFor(id);
       }
-
-      // ✅ create local self snake (used only when running)
-      this._createOrResetLocalSelfSnake(true);
 
       this.ui.setLobbyCode(this.sessionId);
       this.ui.showLobby();
@@ -356,13 +358,6 @@ export class MultiplayerController {
     for (const id of this.rosterIds) {
       const p = this.players.get(id);
       if (p) p.ready = false;
-    }
-
-    // Reset joiner local self so next match starts clean
-    if (!this.isHost) {
-      this._createOrResetLocalSelfSnake(true);
-      this._selfAwaitingRespawn = false;
-      this._localConsumedUntilHostTick.clear();
     }
 
     if (this.isHost) this._broadcastRoster();
@@ -439,11 +434,6 @@ export class MultiplayerController {
         this.localReady = !!this.players.get(this.selfId)?.ready;
         this.ui.setReadyButtonState(this.localReady);
 
-        // slot might change: reset local self spawn (safe in lobby)
-        if (this.matchState !== "running") {
-          this._createOrResetLocalSelfSnake(true);
-        }
-
         this._renderLobbyPlayers();
         break;
       }
@@ -459,17 +449,14 @@ export class MultiplayerController {
         this.matchStartTick = Number(data.startTick ?? 0);
         this.matchEndTick = Number(data.endTick ?? 0);
         this.seed = Number(data.seed ?? this.seed) >>> 0;
-        this.rng = new RNG(this.seed);
 
         this.ui.hideLobby();
         this.ui.setCountdown("");
 
-        // Joiners: fresh local self at match start
-        if (!this.isHost) {
-          this._createOrResetLocalSelfSnake(true);
-          this._selfAwaitingRespawn = false;
-          this._localConsumedUntilHostTick.clear();
-        }
+        // Reset client smoothing anchors
+        this._snapBuf = [];
+        this._lastSnapTick = 0;
+        this._lastSnapAt = 0;
         break;
       }
 
@@ -480,86 +467,13 @@ export class MultiplayerController {
         const snapTick = Number(snap.tick ?? 0);
         const receivedAt = performance.now();
 
-        // client: estimate hostTick offset (effects timing only)
-        if (!this.isHost) {
-          const rawOffset = snapTick - this.tick;
-          this._hostTickOffsetEwma = this._hostTickOffsetEwma * 0.85 + rawOffset * 0.15;
-          this._hostTickOffset = this._hostTickOffsetEwma;
-        }
-
-        // Store snapshot buffer (for OTHER players smoothing + world)
         this._pushSnapshot({ tick: snapTick, receivedAt, snapshot: snap });
 
-        // Update scores
+        // Scores
         if (Array.isArray(snap.players)) {
           for (const sp of snap.players) {
             const p = this.players.get(sp.id);
             if (p) p.score = Number(sp.score ?? 0);
-          }
-        }
-
-        // ✅ Update world truth copy (but respect locally-consumed TTL so food/powerups don't pop back)
-        if (!this.isHost) {
-          this._cleanupLocalConsumedTTL();
-
-          const foods = Array.isArray(snap.foods) ? snap.foods : [];
-          const pus = Array.isArray(snap.powerUps) ? snap.powerUps : [];
-
-          this.foods = foods
-            .map((f) => ({ x: Number(f.x), y: Number(f.y) }))
-            .filter((f) => !this._isSuppressedWorldKey(worldKey("F", f.x, f.y)));
-
-          this.powerUps = pus
-            .map((p) => ({ type: p.type, x: Number(p.x), y: Number(p.y) }))
-            .filter((p) => !this._isSuppressedWorldKey(worldKey("P", p.x, p.y, p.type)));
-        } else {
-          // host already owns foods/powerUps in controller; no need to overwrite
-        }
-
-        // ✅ Apply host truth for self: death/respawn + effect windows + length reconcile ONLY (no teleport)
-        if (!this.isHost && this._selfLocal) {
-          const selfSp = (snap.players ?? []).find((p) => p.id === this.selfId);
-          if (selfSp) {
-            const alive = !!selfSp.alive;
-            const segs = Array.isArray(selfSp.segments) ? selfSp.segments : [];
-
-            // Effect windows in host ticks (authoritative)
-            this._selfLocal.speedUntilHostTick = Number(selfSp.speedUntilTick ?? -1);
-            this._selfLocal.slowUntilHostTick = Number(selfSp.slowUntilTick ?? -1);
-            this._selfLocal.ghostUntilHostTick = Number(selfSp.ghostUntilTick ?? -1);
-
-            // Death: host says dead => stop local sim, wait for respawn segments
-            if (!alive || segs.length === 0) {
-              this._selfLocal.alive = false;
-              this._selfAwaitingRespawn = true;
-              this._selfLocal.snake.segments = [];
-              this._selfLocal.lastSegments = [];
-              this._selfLocal.moveAcc = 0;
-            } else {
-              // Respawn: if we were waiting and host has segments again => snap ONCE (respawn-only)
-              if (this._selfAwaitingRespawn) {
-                this._selfAwaitingRespawn = false;
-                this._snapLocalSelfToHostSegments(segs);
-                this._selfLocal.alive = true;
-              }
-
-              // Length reconcile (safe): only grow if host is longer
-              if (this._selfLocal.alive) {
-                const hostLen = segs.length;
-                const localLen = this._selfLocal.snake.segments.length;
-
-                if (hostLen > localLen) {
-                  const diff = hostLen - localLen;
-                  for (let i = 0; i < diff; i++) this._selfLocal.snake.grow();
-                  // keep lastSegments consistent to reduce visual wobble
-                  this._selfLocal.lastSegments = this._selfLocal.snake.segments.map((s) => ({ ...s }));
-                } else if (hostLen > 0 && localLen - hostLen >= 6) {
-                  // extreme desync: trim tail only (NO head teleport)
-                  this._selfLocal.snake.segments.length = hostLen;
-                  this._selfLocal.lastSegments = this._selfLocal.snake.segments.map((s) => ({ ...s }));
-                }
-              }
-            }
           }
         }
 
@@ -761,172 +675,10 @@ export class MultiplayerController {
       this._tickAcc -= TICK_MS;
       this.tick++;
 
-      if (this.isHost) {
-        this._hostTick();
-      } else {
-        if (this.matchState === "running") {
-          this._clientSelfTick(); // ✅ buttery local self
-        }
-      }
+      if (this.isHost) this._hostTick();
     }
   }
 
-  // --------------------
-  // JOINERS: local self tick + local pickups
-  // --------------------
-  _clientSelfTick() {
-    if (!this._selfLocal) return;
-    if (!this._selfLocal.alive) return;
-
-    // Save lastSegments for interpolation
-    this._selfLocal.lastSegments = this._selfLocal.snake.segments.map((s) => ({ ...s }));
-
-    // Apply direction
-    const d = this._selfLocal.desiredDir ?? this._selfLocal.snake.direction;
-    this._selfLocal.snake.setDirection(d.x, d.y);
-
-    // Speed/Slow timing based on host tick window (authoritative-ish) but applied locally
-    const hostNow = this._localTickToHostTick(this.tick);
-
-    let mult = 1.0;
-    if (hostNow < (this._selfLocal.speedUntilHostTick ?? -1)) mult *= EFFECT.SPEED_MULT;
-    if (hostNow < (this._selfLocal.slowUntilHostTick ?? -1)) mult *= EFFECT.SLOW_MULT;
-    if (!Number.isFinite(mult)) mult = 1.0;
-    mult = Math.max(0, Math.min(3.0, mult));
-
-    this._selfLocal.moveAcc += mult;
-
-    let steps = Math.floor(this._selfLocal.moveAcc);
-    this._selfLocal.moveAcc -= steps;
-    if (steps < 0) steps = 0;
-
-    for (let i = 0; i < steps; i++) {
-      this._selfLocal.snake.step();
-      this._clientHandleLocalPickupsSelf(); // ✅ eat + grow locally
-    }
-  }
-
-  _clientHandleLocalPickupsSelf() {
-    if (!this._selfLocal?.alive) return;
-
-    const head = this._selfLocal.snake.segments[0];
-    if (!head) return;
-
-    const hostNow = this._localTickToHostTick(this.tick);
-
-    // Food
-    const fidx = this.foods.findIndex((f) => f.x === head.x && f.y === head.y);
-    if (fidx !== -1) {
-      const f = this.foods.splice(fidx, 1)[0];
-      this._selfLocal.snake.grow();
-
-      // suppress so it doesn't pop back in from host snapshots briefly
-      this._suppressWorldKey(worldKey("F", f.x, f.y), hostNow + LOCAL_CONSUME_TTL_HOST_TICKS);
-    }
-
-    // Powerups
-    const pidx = this.powerUps.findIndex((p) => p.x === head.x && p.y === head.y);
-    if (pidx !== -1) {
-      const p = this.powerUps.splice(pidx, 1)[0];
-
-      this._suppressWorldKey(worldKey("P", p.x, p.y, p.type), hostNow + LOCAL_CONSUME_TTL_HOST_TICKS);
-
-      // optimistic feel for effects that matter locally
-      switch (p.type) {
-        case PowerUpType.SPEED: {
-          const dur = Math.ceil(EFFECT.SPEED_MS / TICK_MS);
-          this._selfLocal.speedUntilHostTick = Math.max(this._selfLocal.speedUntilHostTick ?? -1, hostNow + dur);
-          break;
-        }
-        case PowerUpType.GHOST: {
-          const dur = Math.ceil(EFFECT.GHOST_MS / TICK_MS);
-          this._selfLocal.ghostUntilHostTick = Math.max(this._selfLocal.ghostUntilHostTick ?? -1, hostNow + dur);
-          break;
-        }
-        case PowerUpType.SLOW:
-          // affects others; host decides. we don't need local action for feel.
-          break;
-        case PowerUpType.SHRINK:
-          // host decides; avoid local shrink (can feel like teleport-tail). host will sync lengths via death/respawn or huge diff.
-          break;
-      }
-    }
-  }
-
-  _localTickToHostTick(localTick) {
-    return localTick + this._hostTickOffset;
-  }
-
-  _createOrResetLocalSelfSnake(force = false) {
-    if (this.isHost) return;
-
-    const slot = this._slotOf(this.selfId);
-    const spawn = getSlotSpawn(slot, this.cols, this.rows);
-
-    if (!force && this._selfLocal) return;
-
-    const snake = new Snake(spawn.x, spawn.y, { startDirection: spawn.dir });
-
-    this._selfLocal = {
-      snake,
-      lastSegments: snake.segments.map((s) => ({ ...s })),
-      desiredDir: { ...spawn.dir },
-      moveAcc: 0,
-      alive: true,
-
-      // effects in host ticks
-      speedUntilHostTick: -1,
-      slowUntilHostTick: -1,
-      ghostUntilHostTick: -1,
-    };
-  }
-
-  // Respawn-only snapping (allowed)
-  _snapLocalSelfToHostSegments(hostSegments) {
-    if (!this._selfLocal) return;
-    if (!hostSegments?.length) return;
-
-    const segs = hostSegments.map((s) => ({ x: Number(s.x), y: Number(s.y) }));
-    this._selfLocal.snake.segments = segs;
-    this._selfLocal.lastSegments = segs.map((s) => ({ ...s }));
-    this._selfLocal.moveAcc = 0;
-
-    // best effort: infer direction
-    if (segs.length >= 2) {
-      const h = segs[0];
-      const n = segs[1];
-      const dx = clampToCardinal(h.x - n.x);
-      const dy = clampToCardinal(h.y - n.y);
-      if (dx !== 0 || dy !== 0) {
-        this._selfLocal.desiredDir = { x: dx, y: dy };
-        this._selfLocal.snake.setDirection(dx, dy);
-      }
-    }
-  }
-
-  _suppressWorldKey(key, untilHostTick) {
-    if (!key) return;
-    const prev = this._localConsumedUntilHostTick.get(key) ?? -1;
-    if (untilHostTick > prev) this._localConsumedUntilHostTick.set(key, untilHostTick);
-  }
-
-  _isSuppressedWorldKey(key) {
-    const until = this._localConsumedUntilHostTick.get(key);
-    if (until == null) return false;
-    const hostNow = this._localTickToHostTick(this.tick);
-    return hostNow <= until;
-  }
-
-  _cleanupLocalConsumedTTL() {
-    const hostNow = this._localTickToHostTick(this.tick);
-    for (const [k, until] of this._localConsumedUntilHostTick.entries()) {
-      if (hostNow > until) this._localConsumedUntilHostTick.delete(k);
-    }
-  }
-
-  // --------------------
-  // Host tick
-  // --------------------
   _hostTick() {
     if (this.matchState === "countdown") {
       const elapsed = this.tick - (this.countdownStartTick ?? this.tick);
@@ -937,18 +689,15 @@ export class MultiplayerController {
         this.matchStartTick = this.tick;
         this.matchEndTick = this.matchStartTick + MATCH_DURATION_TICKS;
 
-        // reset scores
         for (const id of this.rosterIds) {
           const p = this.players.get(id);
           if (p) p.score = 0;
         }
 
-        // new seed for match
         this.seed = (Date.now() ^ this.seed) >>> 0;
         this.rng = new RNG(this.seed);
         this._rebuildWorldHost();
 
-        // respawn all
         for (const id of this.rosterIds) this._respawnPlayerHost(id, true);
 
         this.api.transmit({
@@ -996,13 +745,11 @@ export class MultiplayerController {
       return;
     }
 
-    // snapshots at tickrate
     const snap = this._buildSnapshotHost();
     this.api.transmit({ type: "snapshot", snapshot: snap });
   }
 
   _simulateHostOneTick() {
-    // respawns
     for (const id of this.rosterIds) {
       const rt = this.runtime.get(id);
       if (!rt) continue;
@@ -1011,14 +758,12 @@ export class MultiplayerController {
       }
     }
 
-    // apply direction
     for (const id of this.rosterIds) {
       const rt = this.runtime.get(id);
       if (!rt || !rt.alive) continue;
       rt.snake.setDirection(rt.desiredDir.x, rt.desiredDir.y);
     }
 
-    // steps per tick (speed accumulator)
     const stepsToDo = new Map();
     let maxSteps = 0;
 
@@ -1063,14 +808,12 @@ export class MultiplayerController {
 
     const toDie = new Set();
 
-    // wall collision
     for (const [id, nh] of nextHeads.entries()) {
       if (nh.x < 0 || nh.x >= this.cols || nh.y < 0 || nh.y >= this.rows) {
         toDie.add(id);
       }
     }
 
-    // head-on collision
     const cellMap = new Map();
     for (const [id, nh] of nextHeads.entries()) {
       if (toDie.has(id)) continue;
@@ -1099,7 +842,6 @@ export class MultiplayerController {
       }
     }
 
-    // body collision (self/others), respecting ghost
     const occupied = new Set();
     const tailVacates = new Set();
 
@@ -1141,7 +883,6 @@ export class MultiplayerController {
 
     const head = rt.snake.segments[0];
 
-    // powerups
     const pidx = this.powerUps.findIndex((p) => p.x === head.x && p.y === head.y);
     if (pidx !== -1) {
       const picked = this.powerUps.splice(pidx, 1)[0];
@@ -1176,7 +917,6 @@ export class MultiplayerController {
       while (this.powerUps.length < POWERUP_COUNT) this._spawnPowerUpHost();
     }
 
-    // food
     const fidx = this.foods.findIndex((f) => f.x === head.x && f.y === head.y);
     if (fidx !== -1) {
       this.foods.splice(fidx, 1);
@@ -1331,40 +1071,63 @@ export class MultiplayerController {
   }
 
   // --------------------
-  // Snapshot buffer helpers
+  // Snapshot buffer helpers (clients)
   // --------------------
   _pushSnapshot(entry) {
     this._snapBuf.push(entry);
     this._snapBuf.sort((a, b) => a.tick - b.tick);
-    while (this._snapBuf.length > 8) this._snapBuf.shift();
-  }
 
-  _pickSnapshotsForRender(now) {
-    if (this._snapBuf.length === 0) return null;
-    if (this._snapBuf.length === 1) {
-      return { a: this._snapBuf[0], b: this._snapBuf[0], t: 1 };
+    const last = this._snapBuf[this._snapBuf.length - 1];
+    if (last) {
+      this._lastSnapTick = last.tick;
+      this._lastSnapAt = last.receivedAt;
     }
 
-    const targetTime = now - RENDER_DELAY_MS;
+    while (this._snapBuf.length > 20) this._snapBuf.shift();
+  }
 
-    let bIndex = this._snapBuf.findIndex((s) => s.receivedAt >= targetTime);
+  _pickSnapshotsForRender(now, delayTicks) {
+    if (this._snapBuf.length === 0) return null;
+    if (this._snapBuf.length === 1) return { a: this._snapBuf[0], b: this._snapBuf[0], t: 1 };
+
+    const last = this._snapBuf[this._snapBuf.length - 1];
+    const anchorTick = this._lastSnapTick || last.tick;
+    const anchorAt = this._lastSnapAt || last.receivedAt;
+
+    const dtMs = Math.max(0, now - anchorAt);
+    const hostTickNowEst = anchorTick + dtMs / TICK_MS;
+
+    const targetTick = hostTickNowEst - delayTicks;
+
+    let bIndex = this._snapBuf.findIndex((s) => s.tick >= targetTick);
     if (bIndex === -1) bIndex = this._snapBuf.length - 1;
     if (bIndex === 0) bIndex = 1;
 
     const a = this._snapBuf[bIndex - 1];
     const b = this._snapBuf[bIndex];
 
-    const denom = Math.max(30, b.receivedAt - a.receivedAt);
-    const t = Math.max(0, Math.min(1, (targetTime - a.receivedAt) / denom));
+    const span = Math.max(1, b.tick - a.tick);
+    const t = Math.max(0, Math.min(1, (targetTick - a.tick) / span));
 
     return { a, b, t };
+  }
+
+  _estimateHostTick(now) {
+    if (this.isHost) return this.tick;
+
+    const last = this._snapBuf[this._snapBuf.length - 1];
+    if (!last) return this.tick;
+
+    const anchorTick = this._lastSnapTick || last.tick;
+    const anchorAt = this._lastSnapAt || last.receivedAt;
+    const dtMs = Math.max(0, now - anchorAt);
+    return anchorTick + dtMs / TICK_MS;
   }
 
   // --------------------
   // Render
   // --------------------
   _render(now) {
-    // Countdown text
     if (this.matchState === "countdown" && this.countdownStartTick != null) {
       const hostTickEstimate = this._estimateHostTick(now);
       const elapsed = hostTickEstimate - this.countdownStartTick;
@@ -1376,51 +1139,63 @@ export class MultiplayerController {
       this.ui.setCountdown("");
     }
 
-    const progress = Math.max(0, Math.min(1, this._tickAcc / TICK_MS));
-
     if (this.isHost) {
       const snap = this._buildSnapshotHost();
+      const progress = Math.max(0, Math.min(1, this._tickAcc / TICK_MS));
       const state = this._snapshotToRenderStateHost(snap, progress);
       this.game.renderer.render(state);
       return;
     }
 
     // CLIENT:
-    // - world from controller foods/powerUps (already filtered for local-consume TTL)
-    // - self from local sim (buttery)
-    // - others from snapshot buffer smoothing
+    // - World + others: delayed (smooth)
+    // - Self: near-zero delay (less input lag)
+    const pickedOthers = this._pickSnapshotsForRender(now, this._othersDelayTicks);
+    const pickedSelf = this._pickSnapshotsForRender(now, this._selfDelayTicks);
+
+    if (!pickedOthers || !pickedSelf) return;
+
+    const foods = pickedOthers.b.snapshot.foods ?? [];
+    const powerUps = pickedOthers.b.snapshot.powerUps ?? [];
+
     const snakes = [];
 
-    // World
-    const foods = this.foods.map((f) => ({ ...f }));
-    const powerUps = this.powerUps.map((p) => ({ ...p }));
+    // Self snake: render from near-latest snapshots
+    {
+      const prevSnap = pickedSelf.a.snapshot;
+      const nextSnap = pickedSelf.b.snapshot;
+      const t = pickedSelf.t;
 
-    // Self (local)
-    if (this.matchState === "running" && this._selfLocal) {
-      const slot = this._slotOf(this.selfId);
-      const colors = SLOT_COLORS[slot] ?? SLOT_COLORS[0];
+      const prevPlayers = new Map((prevSnap.players ?? []).map((p) => [p.id, p]));
+      const sp = (nextSnap.players ?? []).find((p) => p.id === this.selfId);
 
-      const prevSegs = this._selfLocal.lastSegments ?? [];
-      const nextSegs = this._selfLocal.snake.segments ?? [];
-      const segsToDraw = interpolateSegments(prevSegs, nextSegs, progress);
+      if (sp) {
+        const slot = Number(sp.slot ?? 0);
+        const colors = SLOT_COLORS[slot] ?? SLOT_COLORS[0];
 
-      snakes.push({
-        segments: segsToDraw,
-        mpColorBody: colors.body,
-        mpColorGlow: colors.glow,
-        colorHead: "#d783ff",
-        colorHeadStroke: "#b300ff",
-        colorBody: colors.body,
-        tailScale: 0.6,
-      });
+        const prev = prevPlayers.get(sp.id);
+        const prevSegs = prev?.segments ?? sp.segments ?? [];
+        const nextSegs = sp.segments ?? [];
+
+        const segsToDraw = interpolateSegments(prevSegs, nextSegs, t);
+
+        snakes.push({
+          segments: segsToDraw,
+          mpColorBody: colors.body,
+          mpColorGlow: colors.glow,
+          colorHead: "#d783ff",
+          colorHeadStroke: "#b300ff",
+          colorBody: colors.body,
+          tailScale: 0.6,
+        });
+      }
     }
 
-    // Others (smoothed)
-    const picked = this._pickSnapshotsForRender(now);
-    if (picked) {
-      const { a, b, t } = picked;
-      const prevSnap = a.snapshot;
-      const nextSnap = b.snapshot;
+    // Other snakes: render delayed & smooth
+    {
+      const prevSnap = pickedOthers.a.snapshot;
+      const nextSnap = pickedOthers.b.snapshot;
+      const t = pickedOthers.t;
 
       const prevPlayers = new Map((prevSnap.players ?? []).map((p) => [p.id, p]));
       for (const sp of nextSnap.players ?? []) {
@@ -1430,8 +1205,9 @@ export class MultiplayerController {
         const colors = SLOT_COLORS[slot] ?? SLOT_COLORS[0];
 
         const prev = prevPlayers.get(sp.id);
-        const prevSegs = (prev?.segments ?? sp.segments ?? []);
-        const nextSegs = (sp.segments ?? []);
+        const prevSegs = prev?.segments ?? sp.segments ?? [];
+        const nextSegs = sp.segments ?? [];
+
         const segsToDraw = interpolateSegments(prevSegs, nextSegs, t);
 
         snakes.push({
@@ -1447,16 +1223,6 @@ export class MultiplayerController {
     }
 
     this.game.renderer.render({ foods, powerUps, activeEffects: [], snakes });
-  }
-
-  _estimateHostTick(now) {
-    if (this.isHost) return this.tick;
-    const picked = this._pickSnapshotsForRender(now);
-    if (picked) {
-      const { a, b, t } = picked;
-      return a.tick + (b.tick - a.tick) * t;
-    }
-    return this.tick + this._hostTickOffset;
   }
 
   _snapshotToRenderStateHost(snap, progress) {
@@ -1524,17 +1290,13 @@ export class MultiplayerController {
 
     this.foods = [];
     this.powerUps = [];
+
     this._snapBuf = [];
+    this._lastSnapTick = 0;
+    this._lastSnapAt = 0;
 
     this.seed = (Date.now() ^ ((Math.random() * 0xffffffff) >>> 0)) >>> 0;
     this.rng = new RNG(this.seed);
-
-    this._hostTickOffset = 0;
-    this._hostTickOffsetEwma = 0;
-
-    this._selfLocal = null;
-    this._selfAwaitingRespawn = false;
-    this._localConsumedUntilHostTick.clear();
 
     this._tickAcc = 0;
   }
@@ -1598,14 +1360,4 @@ function interpolateSegments(prevSegs, nextSegs, t) {
   }
 
   return out;
-}
-
-function clampToCardinal(v) {
-  if (v > 0) return 1;
-  if (v < 0) return -1;
-  return 0;
-}
-
-function worldKey(kind, x, y, type = "") {
-  return `${kind}:${x},${y}:${type}`;
 }
