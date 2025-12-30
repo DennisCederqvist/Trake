@@ -21,7 +21,7 @@ export const EFFECT = {
   SLOW_MS: 3500,
 
   // Ghost: ignorerar self-collision (väggen är fortfarande dödlig)
-  GHOST_MS: 2500,
+  GHOST_MS: 3500,
 
   // Shrink: hur många segment som försvinner direkt
   SHRINK_AMOUNT: 4,

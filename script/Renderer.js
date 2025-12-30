@@ -88,7 +88,20 @@ export class Renderer {
         const glow = snake.mpColorGlow ?? "rgba(0, 255, 255, 0.85)";
         const core = snake.mpColorBody ?? "rgba(200, 255, 255, 0.95)";
 
+        // ✅ Ghost detection (correct for your code):
+        // In singleplayer: state.activeEffects is an ARRAY of {type, endsAt}
+        // In multiplayer (if you ever add per-snake effects): snake.activeEffects may exist.
+        const ghostActive =
+          hasEffect(snake.activeEffects, PowerUpType.GHOST) ||
+          hasEffect(state.activeEffects, PowerUpType.GHOST) ||
+          snake.isGhost === true ||
+          snake.ghost === true;
+
+        const alpha = ghostActive ? 0.45 : 1.0;
+
+        // Body
         ctx.save();
+        ctx.globalAlpha = alpha;
 
         ctx.beginPath();
         ctx.moveTo(ortho[0].x, ortho[0].y);
@@ -111,6 +124,7 @@ export class Renderer {
 
         ctx.restore();
 
+        // Head
         const headPx = toPx(segments[0]);
 
         let angle = 0;
@@ -125,6 +139,7 @@ export class Renderer {
         const radius = Math.max(4, this.cellSize * 0.18);
 
         ctx.save();
+        ctx.globalAlpha = alpha;
         ctx.translate(headPx.x, headPx.y);
         ctx.rotate(angle);
 
@@ -184,7 +199,13 @@ export class Renderer {
 
     // Small highlight
     ctx.beginPath();
-    ctx.arc(x - rInner * 0.25, y - rInner * 0.25, Math.max(2, rInner * 0.25), 0, Math.PI * 2);
+    ctx.arc(
+      x - rInner * 0.25,
+      y - rInner * 0.25,
+      Math.max(2, rInner * 0.25),
+      0,
+      Math.PI * 2
+    );
     ctx.fillStyle = "rgba(255,255,255,0.06)";
     ctx.fill();
 
@@ -192,7 +213,6 @@ export class Renderer {
   }
 
   drawSpecial(s) {
-    // Bonus & Mirror ritas som “diamant”-rutor men med egen färg
     const ctx = this.ctx;
     const px = (s.x + 0.5) * this.cellSize;
     const py = (s.y + 0.5) * this.cellSize;
@@ -214,9 +234,9 @@ export class Renderer {
     let r = Math.max(5, this.cellSize * 0.22);
 
     if (s.type === PowerUpType.BONUS || s.type === "bonus") {
-      r = Math.max(7, this.cellSize * 0.30);   // större bonus
+      r = Math.max(7, this.cellSize * 0.30);
     } else if (s.type === PowerUpType.MIRROR || s.type === "mirror") {
-      r = Math.max(6, this.cellSize * 0.22);   // normal mirror (eller justera)
+      r = Math.max(6, this.cellSize * 0.22);
     }
 
     ctx.save();
@@ -344,6 +364,13 @@ export class Renderer {
 
     return ortho;
   }
+}
+
+// ✅ activeEffects helper: supports your array format [{type, endsAt}]
+function hasEffect(activeEffects, type) {
+  if (!activeEffects) return false;
+  if (Array.isArray(activeEffects)) return activeEffects.some((e) => e?.type === type);
+  return false;
 }
 
 function roundRect(ctx, x, y, w, h, r) {
