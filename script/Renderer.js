@@ -258,9 +258,9 @@ export class Renderer {
       fill = "rgba(180, 90, 255, 0.18)";
       core = "rgba(240, 220, 255, 0.95)";
     } else if (p.type === PowerUpType.SHRINK) {
-      glow = "rgba(255, 0, 0, 0.85)";
-      fill = "rgba(175, 90, 255, 0.36)";
-      core = "rgba(95, 169, 253, 0.95)";
+      glow = "rgba(255, 70, 70, 0.85)";
+      fill = "rgba(255, 70, 70, 0.18)";
+      core = "rgba(255, 220, 220, 0.95)";
     }
 
     const r = Math.max(5, this.cellSize * 0.22);

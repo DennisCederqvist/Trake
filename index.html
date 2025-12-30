@@ -3,19 +3,24 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Trake 'Em</title>
+    <title>Trake</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
 
   <body>
     <audio id="bgm" src="assets/musik/Trake(extended).mp3" loop preload="auto"></audio>
+    <audio id="sfxBoob"  src="assets/musik/trake-boop.wav"  preload="auto"></audio>
+<audio id="sfxCrash" src="assets/musik/trake-crash.wav" preload="auto"></audio>
+<audio id="sfxYum"   src="assets/musik/trake-yum.wav"   preload="auto"></audio>
+<audio id="sfxZoom"  src="assets/musik/trake-zoom.wav"  preload="auto"></audio>
+
 
     <section class="game-section">
       <div class="game-ui">
         <div class="game-ui__left">
           <h2>Controlls</h2>
           <p>
-            Use arrow-keys to control your Bike
+            Use WASD or arrow-keys to control your Snike
           </p>
         </div>
 
@@ -31,7 +36,7 @@
 
         <!-- Start -->
         <div id="startScreen" class="overlay">
-          <h1 class="overlay__title titleFliker">Trake 'Em</h1>
+          <h1 class="overlay__title titleFliker">Trake</h1>
           <button id="startButton" class="overlay__button">Singleplayer</button>
           <button id="multiplayerButton" class="overlay__button">Multiplayer</button>
         </div>
@@ -112,14 +117,47 @@
           </div>
         </div>
       </div>
+
+
       <div class="powerupWrapper">
-        <div class="powerup">
-          <h2>Power Ups</h2>
-          <p>Yellow = Speedboost.</p>
-          <p>Blue = Slowdown (opponents in multiplayer).</p>
-          <p>Purple = Phase through self.</p>
-          <p>Red = Tail Shrink.</p>
+        <h2>Power Ups</h2>
+
+        <div class="powerupGrid">
+          <div>
+            <p>Yellow = Speedboost.</p>
+            <p>Blue = Slowdown (freezes opponents in multiplayer).</p>
+            <p>Purple = Phase through self (and others).</p>
+            <p>Red = Tail Shrinks 4 steps</p>
+          </div>
+
+          <div>
+            <p>Green = +100 points</p>
+            <p>Black = Hazards! Avoid these</p>
+            <p>Pink = Inverted Controls, Good Luck!</p>
+          </div>
         </div>
+      </div>
+
+    </section>
+
+
+    <section>
+      <div class="about">
+        <h2>What is Trake</h2>
+
+        <div class="history">
+          <p>
+            What happens when you grab the first globaly recognized mobile game ever made SNAKE (1997) by Nokia and the much more obscure arcade game of TRON: Light Cycles (1982) by Bally Midway and smooch them together?<br>
+            Thats right you get TRon/snAKE = TRAKE!
+            <br>
+            <br>
+            Trake is a school project made by Dennis C for ChasAcademy, to learn the basics of how to use LLM's during the workprocess and how to implement some simple online/multiplayer functionality. 
+            However, the first part went very well, the second part tho... Well, let's just say, it could have gone better. 
+            <br>
+            But hey, it got done!
+          </p>
+        </div>
+
       </div>
     </section>
 

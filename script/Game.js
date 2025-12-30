@@ -389,9 +389,11 @@ export class Game {
       const picked = this.specials.splice(sidx, 1)[0];
 
       if (picked.type === PowerUpType.BONUS) {
+		window.__trakeSfx?.play("yum");
         this.score += SPECIAL.BONUS_SCORE;
         this.updateScore();
       } else if (picked.type === PowerUpType.MIRROR) {
+		window.__trakeSfx?.play("yum");
         this.mirroredUntil = Math.max(this.mirroredUntil, this.now + SPECIAL.MIRROR_EFFECT_MS);
       }
     }
@@ -402,15 +404,19 @@ export class Game {
       switch (picked.type) {
         case PowerUpType.SPEED:
           this.powerUps.activate(PowerUpType.SPEED, this.now, EFFECT.SPEED_MS);
+		  window.__trakeSfx?.play("zoom");
           break;
         case PowerUpType.SLOW:
           this.powerUps.activate(PowerUpType.SLOW, this.now, EFFECT.SLOW_MS);
+		  window.__trakeSfx?.play("yum");
           break;
         case PowerUpType.GHOST:
           this.powerUps.activate(PowerUpType.GHOST, this.now, EFFECT.GHOST_MS);
+		  window.__trakeSfx?.play("yum");
           break;
         case PowerUpType.SHRINK:
           this.snake.shrink(EFFECT.SHRINK_AMOUNT, EFFECT.MIN_SNAKE_LEN);
+		  window.__trakeSfx?.play("yum");
           break;
       }
       this.schedulePowerRespawn();
@@ -421,6 +427,7 @@ export class Game {
     if (eatenIndex !== -1) {
       this.snake.grow();
       this.score += 10;
+	  window.__trakeSfx?.play("yum");
       this.updateScore();
 
       this.foods.splice(eatenIndex, 1);
@@ -430,6 +437,7 @@ export class Game {
 
   handleDeath() {
     this.isRunning = false;
+	window.__trakeSfx?.play("crash");
     if (this.onPlayerDeath) this.onPlayerDeath({ score: this.score });
   }
 

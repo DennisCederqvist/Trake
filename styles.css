@@ -8,7 +8,7 @@ body {
   background: #111;
   color: #fff;
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  margin-top: 100px;
+  margin-top: 50px;
 }
 
 h1,
@@ -233,13 +233,22 @@ h2 {
 
 .powerupWrapper {
   width: min(95vw, 95vh);
-  display: flex;
-  justify-content: flex-start;
+  margin: 0 auto;
 }
 
-.powerups {
-  align-items: flex-start;
+.powerupGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2rem;
 }
+
+/* Mobil */
+@media (max-width: 700px) {
+  .powerupGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
 
 
 /* Title Animation */
@@ -347,4 +356,12 @@ h2 {
   60%  { transform: translate3d(2px, 2px, 0); }
   80%  { transform: translate3d(2px, -2px, 0); }
   100% { transform: translate3d(0, 0, 0); }
+}
+
+.about {
+  display: flex;
+  flex-direction: column;
+  width: 45%;
+  margin: 0 auto;
+  margin-top: 30px;
 }
