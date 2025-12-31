@@ -69,10 +69,12 @@ if (bgm) {
 		yum: document.getElementById("sfxYum"),
 		zoom: document.getElementById("sfxZoom"),
 
-    speed: document.getElementById("sfxSpeed"),
-    mirrored: document.getElementById("sfxMirrored"),
-    plus100: document.getElementById("sfxPlus100"),
-    ghosting: document.getElementById("sfxGhosting"),
+		speed: document.getElementById("sfxSpeed"),
+		mirrored: document.getElementById("sfxMirrored"),
+		plus100: document.getElementById("sfxPlus100"),
+		ghosting: document.getElementById("sfxGhosting"),
+		freeze: document.getElementById("sfxFreeze"),
+		tail: document.getElementById("sfxTail"),
 	};
 
 	// Warn if missing, but don't crash
@@ -88,10 +90,13 @@ if (bgm) {
 	if (sfx.yum) sfx.yum.volume = 0.7;
 	if (sfx.zoom) sfx.zoom.volume = 0.8;
 
-  if (sfx.speed) sfx.speed.volume = 0.85;
-  if (sfx.mirrored) sfx.mirrored.volume = 0.85;
-  if (sfx.plus100) sfx.plus100.volume = 0.9;
-  if (sfx.ghosting) sfx.ghosting.volume = 0.85;
+	if (sfx.speed) sfx.speed.volume = 0.85;
+	if (sfx.mirrored) sfx.mirrored.volume = 0.85;
+	if (sfx.plus100) sfx.plus100.volume = 0.9;
+	if (sfx.ghosting) sfx.ghosting.volume = 0.85;
+
+	if (sfx.freeze) sfx.freeze.volume = 0.85;
+	if (sfx.tail) sfx.tail.volume = 0.85;
 
 	if (bgm) bgm.volume = 0.14;
 

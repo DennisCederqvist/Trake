@@ -412,6 +412,7 @@ export class Game {
         case PowerUpType.SLOW:
           this.powerUps.activate(PowerUpType.SLOW, this.now, EFFECT.SLOW_MS);
 		  window.__trakeSfx?.play("yum");
+      window.__trakeSfx?.play("freeze");
           break;
         case PowerUpType.GHOST:
           this.powerUps.activate(PowerUpType.GHOST, this.now, EFFECT.GHOST_MS);
@@ -421,6 +422,7 @@ export class Game {
         case PowerUpType.SHRINK:
           this.snake.shrink(EFFECT.SHRINK_AMOUNT, EFFECT.MIN_SNAKE_LEN);
 		  window.__trakeSfx?.play("yum");
+      window.__trakeSfx?.play("tail");
           break;
       }
       this.schedulePowerRespawn();
