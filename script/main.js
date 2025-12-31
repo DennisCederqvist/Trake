@@ -19,6 +19,49 @@ function setupAudio() {
 	const bgm = document.getElementById("bgm");
 	const soundBtn = document.getElementById("soundToggle");
 
+ // === BGM PLAYLIST ===
+if (bgm) bgm.loop = false; // safety in case loop is still present in HTML
+
+const bgmPlaylist = [
+	"assets/musik/Trake(extended).mp3",
+	"assets/musik/ElectricPulse.mp3",
+	"assets/musik/ElectricPulse2.mp3",
+	"assets/musik/PixelCarnage.mp3",
+	"assets/musik/PixelVenom.mp3",
+	"assets/musik/PixelVenom2.mp3",
+];
+
+let bgmIndex = Math.floor(Math.random() * bgmPlaylist.length);
+
+function setBgmTrack(i) {
+	if (!bgm || !bgmPlaylist.length) return;
+	bgmIndex = ((i % bgmPlaylist.length) + bgmPlaylist.length) % bgmPlaylist.length;
+	bgm.src = bgmPlaylist[bgmIndex];
+	bgm.load();
+}
+
+function nextRandomIndex(current, length) {
+		if (length <= 1) return current;
+		let next;
+		do {
+			next = Math.floor(Math.random() * length);
+		} while (next === current);
+		return next;
+	}
+
+setBgmTrack(bgmIndex);
+
+// NOTE: wantsBgm() is defined later in your setupAudio(), that's fine.
+// This handler will only run after setupAudio() has completed.
+if (bgm) {
+	bgm.addEventListener("ended", async () => {
+		if (!wantsBgm()) return;
+		setBgmTrack(nextRandomIndex(bgmIndex, bgmPlaylist.length));
+		try { await bgm.play(); } catch {}
+	});
+}
+
+
 	const sfx = {
 		boob: document.getElementById("sfxBoob"),
 		crash: document.getElementById("sfxCrash"),
